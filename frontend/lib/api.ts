@@ -83,9 +83,12 @@ export interface Recording {
   started_at: string;
   ended_at: string | null;
   expires_at: string;
+  hours_left: number;
   duration_seconds: number;
   download_url: string | null;
   file_size: number;
+  file_size_mb: number;
+  s3_key: string;
 }
 
 class ApiError extends Error {

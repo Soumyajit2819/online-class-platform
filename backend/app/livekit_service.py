@@ -26,7 +26,7 @@ class RecordingState:
     def add_recording(self, room_code: str, recording_id: str, egress_id: str,
                       livekit_room_name: str, class_name: str, teacher_name: str):
         now    = datetime.utcnow()
-        expiry = now + timedelta(days=3)
+        expiry = now + timedelta(hours=20)
         self.recordings[recording_id] = {
             "recording_id":      recording_id,
             "egress_id":         egress_id,
@@ -451,7 +451,7 @@ class LiveKitService:
                         last_modified = obj['LastModified']   # tz-aware
                         file_size     = obj['Size']
 
-                        expires_at  = last_modified + timedelta(days=3)
+                        expires_at  = last_modified + timedelta(hours=20)
                         now_utc     = datetime.now(timezone.utc)
 
                         if expires_at <= now_utc:
@@ -510,7 +510,7 @@ class LiveKitService:
                     for obj in page.get('Contents', []):
                         key           = obj['Key']
                         last_modified = obj['LastModified']  # tz-aware
-                        expires_at    = last_modified + timedelta(days=3)
+                        expires_at    = last_modified + timedelta(hours=20)
                         now_utc       = datetime.now(timezone.utc)
 
                         if expires_at <= now_utc:
@@ -531,7 +531,7 @@ class LiveKitService:
                 return s3.generate_presigned_url(
                     'get_object',
                     Params={'Bucket': self.s3_bucket, 'Key': s3_key},
-                    ExpiresIn=3 * 24 * 3600,
+                    ExpiresIn=20 * 3600,
                 )
             except Exception as e:
                 print(f"Error generating download URL: {e}")

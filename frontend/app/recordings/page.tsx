@@ -1,210 +1,289 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import Link from 'next/link'
 import { api, Recording } from '@/lib/api'
 
-export default function RecordingsPage() {
-  const [recordings, setRecordings] = useState<Recording[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
+// ---------------------------------------------------------------------------
+// Countdown hook — re-renders every second
+// ---------------------------------------------------------------------------
+function useCountdown(expiresAt: string) {
+  const calc = () => {
+    const diff = new Date(expiresAt).getTime() - Date.now()
+    if (diff <= 0) return { expired: true, text: 'Expired', pct: 0, urgent: false }
+
+    const totalMs = 20 * 60 * 60 * 1000   // 20 hours in ms
+    const pct     = Math.max(0, Math.min(100, (diff / totalMs) * 100))
+
+    const h = Math.floor(diff / 3600000)
+    const m = Math.floor((diff % 3600000) / 60000)
+    const s = Math.floor((diff % 60000) / 1000)
+
+    const text = h > 0
+      ? `${h}h ${m}m left`
+      : m > 0
+        ? `${m}m ${s}s left`
+        : `${s}s left`
+
+    return { expired: false, text, pct, urgent: diff < 2 * 3600000 } // urgent if < 2h
+  }
+
+  const [state, setState] = useState(calc)
 
   useEffect(() => {
-    fetchRecordings()
-  }, [])
+    setState(calc())
+    const id = setInterval(() => {
+      const next = calc()
+      setState(next)
+      if (next.expired) clearInterval(id)
+    }, 1000)
+    return () => clearInterval(id)
+  }, [expiresAt])
 
-  const fetchRecordings = async () => {
+  return state
+}
+
+// ---------------------------------------------------------------------------
+// Single recording card
+// ---------------------------------------------------------------------------
+function RecordingCard({ recording, onDownload }: {
+  recording: Recording
+  onDownload: (id: string) => void
+}) {
+  const countdown = useCountdown(recording.expires_at)
+
+  const barColor = countdown.urgent
+    ? 'bg-red-500'
+    : countdown.pct > 50
+      ? 'bg-green-500'
+      : 'bg-yellow-500'
+
+  const formatDate = (d: string) =>
+    new Date(d).toLocaleDateString('en-US', {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    })
+
+  const formatSize = (mb: number) =>
+    mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb} MB`
+
+  return (
+    <div className={`bg-white rounded-xl shadow-md hover:shadow-lg transition-shadow p-6 border-l-4 ${
+      countdown.expired ? 'border-gray-300 opacity-50' : countdown.urgent ? 'border-red-500' : 'border-blue-500'
+    }`}>
+      <div className="flex items-start justify-between gap-4">
+        {/* Info */}
+        <div className="flex-1 min-w-0">
+          <h3 className="text-xl font-semibold text-gray-900 truncate">
+            {recording.class_name}
+          </h3>
+          <p className="text-sm text-gray-500 mt-1">
+            Teacher: <span className="font-medium text-gray-700">{recording.teacher_name}</span>
+          </p>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500">
+            <span>🗓 {formatDate(recording.started_at)}</span>
+            {recording.file_size_mb > 0 && (
+              <span>💾 {formatSize(recording.file_size_mb)}</span>
+            )}
+          </div>
+        </div>
+
+        {/* Download button */}
+        <div className="flex flex-col items-end gap-2 flex-shrink-0">
+          {!countdown.expired ? (
+            <button
+              onClick={() => onDownload(recording.recording_id)}
+              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              Download MP4
+            </button>
+          ) : (
+            <span className="px-4 py-2 bg-gray-100 text-gray-500 rounded-lg text-sm">
+              Link Expired
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Countdown bar */}
+      {!countdown.expired && (
+        <div className="mt-4">
+          <div className="flex justify-between items-center mb-1">
+            <span className={`text-sm font-medium ${
+              countdown.urgent ? 'text-red-600' : 'text-gray-600'
+            }`}>
+              {countdown.urgent ? '⚠️ ' : '⏰ '}
+              {countdown.text}
+            </span>
+            <span className="text-xs text-gray-400">
+              Available for 20 hours after recording
+            </span>
+          </div>
+          <div className="w-full bg-gray-200 rounded-full h-2">
+            <div
+              className={`h-2 rounded-full transition-all duration-1000 ${barColor}`}
+              style={{ width: `${countdown.pct}%` }}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main page
+// ---------------------------------------------------------------------------
+export default function RecordingsPage() {
+  const [recordings, setRecordings]   = useState<Recording[]>([])
+  const [loading, setLoading]         = useState(true)
+  const [error, setError]             = useState('')
+  const [downloading, setDownloading] = useState<string | null>(null)
+  const [toast, setToast]             = useState('')
+
+  const showToast = (msg: string) => {
+    setToast(msg)
+    setTimeout(() => setToast(''), 3000)
+  }
+
+  const fetchRecordings = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      const response = await api.getAllRecordings()
-      setRecordings(response.recordings)
+      const res = await api.getAllRecordings()
+      // Filter out already-expired ones client-side too
+      const valid = res.recordings.filter(
+        r => new Date(r.expires_at).getTime() > Date.now()
+      )
+      setRecordings(valid)
     } catch (err: any) {
       setError(err.message || 'Failed to fetch recordings')
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
+
+  useEffect(() => {
+    fetchRecordings()
+    // Refresh list every 60s to catch newly available recordings
+    const id = setInterval(fetchRecordings, 60000)
+    return () => clearInterval(id)
+  }, [fetchRecordings])
 
   const handleDownload = async (recordingId: string) => {
+    setDownloading(recordingId)
     try {
       const result = await api.getRecordingDownloadUrl(recordingId)
       if (result.download_url) {
-        // Open download URL in new tab
-        window.open(result.download_url, '_blank')
+        // Create hidden link and click it to trigger download
+        const a = document.createElement('a')
+        a.href     = result.download_url
+        a.download = `class-recording-${recordingId}.mp4`
+        a.target   = '_blank'
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        showToast('Download started!')
       } else {
-        alert('Download URL not available yet. Please try again later.')
+        showToast('Download URL not available. Try again shortly.')
       }
     } catch (err: any) {
-      alert(err.message || 'Failed to get download URL')
-    }
-  }
-
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
-    return date.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  }
-
-  const getExpiryStatus = (expiresAt: string) => {
-    const now = new Date()
-    const expiry = new Date(expiresAt)
-    const hoursLeft = Math.floor((expiry.getTime() - now.getTime()) / (1000 * 60 * 60))
-    
-    if (hoursLeft < 0) {
-      return { text: 'Expired', color: 'text-red-600' }
-    } else if (hoursLeft < 24) {
-      return { text: `${hoursLeft} hours left`, color: 'text-orange-600' }
-    } else {
-      const daysLeft = Math.floor(hoursLeft / 24)
-      return { text: `${daysLeft} day${daysLeft > 1 ? 's' : ''} left`, color: 'text-green-600' }
-    }
-  }
-
-  const formatDuration = (seconds: number) => {
-    const hours = Math.floor(seconds / 3600)
-    const minutes = Math.floor((seconds % 3600) / 60)
-    const secs = seconds % 60
-    
-    if (hours > 0) {
-      return `${hours}h ${minutes}m ${secs}s`
-    } else if (minutes > 0) {
-      return `${minutes}m ${secs}s`
-    } else {
-      return `${secs}s`
+      showToast(err.message || 'Download failed')
+    } finally {
+      setDownloading(null)
     }
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-purple-50 to-indigo-100 p-8">
-      <div className="max-w-6xl mx-auto">
+    <main className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50 p-8">
+      {/* Toast notification */}
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 bg-gray-900 text-white px-6 py-3 rounded-lg shadow-lg text-sm">
+          {toast}
+        </div>
+      )}
+
+      <div className="max-w-4xl mx-auto">
+        {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-3xl font-bold text-gray-900">Class Recordings</h1>
-            <p className="text-gray-600 mt-1">Download your class recordings (available for 3 days)</p>
+            <p className="text-gray-500 mt-1">
+              Downloads available for <span className="font-semibold text-blue-600">20 hours</span> after recording ends
+            </p>
           </div>
-          <div className="flex gap-4">
+          <div className="flex gap-3">
             <button
               onClick={fetchRecordings}
-              className="px-4 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+              disabled={loading}
+              className="px-4 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-sm transition-colors disabled:opacity-50"
             >
-              Refresh
+              {loading ? 'Refreshing...' : '↻ Refresh'}
             </button>
             <Link
               href="/"
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm transition-colors"
             >
-              Back to Home
+              ← Home
             </Link>
           </div>
         </div>
 
-        {loading ? (
-          <div className="flex items-center justify-center py-20">
-            <div className="text-gray-600">Loading recordings...</div>
+        {/* Info banner */}
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6 flex gap-3">
+          <span className="text-2xl">ℹ️</span>
+          <div className="text-sm text-blue-800">
+            <p className="font-semibold mb-1">About Recordings</p>
+            <ul className="space-y-0.5 text-blue-700">
+              <li>• Recordings are saved automatically when class ends</li>
+              <li>• Available to download for <strong>20 hours</strong> only</li>
+              <li>• Download the MP4 file to your device before the timer expires</li>
+              <li>• After 20 hours the file is permanently deleted from our servers</li>
+            </ul>
+          </div>
+        </div>
+
+        {/* Content */}
+        {loading && recordings.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-24 text-gray-400">
+            <div className="w-10 h-10 border-4 border-blue-300 border-t-blue-600 rounded-full animate-spin mb-4" />
+            Loading recordings...
           </div>
         ) : error ? (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-6 text-center">
-            <p className="text-red-700">{error}</p>
+          <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-center">
+            <p className="text-red-700 mb-3">{error}</p>
             <button
               onClick={fetchRecordings}
-              className="mt-4 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg"
+              className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm"
             >
               Try Again
             </button>
           </div>
         ) : recordings.length === 0 ? (
-          <div className="bg-white rounded-lg shadow-md p-12 text-center">
+          <div className="bg-white rounded-xl shadow-md p-16 text-center">
             <div className="text-6xl mb-4">📹</div>
             <h2 className="text-xl font-semibold text-gray-800 mb-2">No Recordings Available</h2>
-            <p className="text-gray-600">
-              Class recordings will appear here after your teacher ends a recorded session.
+            <p className="text-gray-500 text-sm max-w-sm mx-auto">
+              Recordings appear here after your teacher starts and stops recording during a class.
+              Links expire after 20 hours.
             </p>
           </div>
         ) : (
-          <div className="grid gap-6">
-            {recordings.map((recording) => {
-              const expiryStatus = getExpiryStatus(recording.expires_at)
-              return (
-                <div
-                  key={recording.recording_id}
-                  className="bg-white rounded-lg shadow-md hover:shadow-lg transition-shadow p-6"
-                >
-                  <div className="flex items-start justify-between">
-                    <div className="flex-1">
-                      <h3 className="text-xl font-semibold text-gray-900 mb-2">
-                        {recording.class_name}
-                      </h3>
-                      <div className="space-y-1 text-sm text-gray-600">
-                        <p>
-                          <span className="font-medium">Teacher:</span> {recording.teacher_name}
-                        </p>
-                        <p>
-                          <span className="font-medium">Recorded:</span> {formatDate(recording.started_at)}
-                        </p>
-                        {recording.duration_seconds > 0 && (
-                          <p>
-                            <span className="font-medium">Duration:</span> {formatDuration(recording.duration_seconds)}
-                          </p>
-                        )}
-                        <p className={`font-medium ${expiryStatus.color}`}>
-                          {expiryStatus.text}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex flex-col items-end gap-3">
-                      <span
-                        className={`px-3 py-1 rounded-full text-sm font-medium ${
-                          recording.status === 'available'
-                            ? 'bg-green-100 text-green-800'
-                            : recording.status === 'failed'
-                            ? 'bg-red-100 text-red-800'
-                            : 'bg-yellow-100 text-yellow-800'
-                        }`}
-                      >
-                        {recording.status.charAt(0).toUpperCase() + recording.status.slice(1)}
-                      </span>
-                      {recording.status === 'available' && (
-                        <button
-                          onClick={() => handleDownload(recording.recording_id)}
-                          className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors flex items-center gap-2"
-                        >
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                          </svg>
-                          Download
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  
-                  {recording.status === 'available' && (
-                    <div className="mt-4 pt-4 border-t border-gray-100">
-                      <p className="text-xs text-gray-500">
-                        ⏰ Recording will be available for download until {formatDate(recording.expires_at)}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              )
-            })}
+          <div className="space-y-4">
+            <p className="text-sm text-gray-500">{recordings.length} recording{recordings.length !== 1 ? 's' : ''} available</p>
+            {recordings.map(rec => (
+              <RecordingCard
+                key={rec.recording_id}
+                recording={rec}
+                onDownload={handleDownload}
+              />
+            ))}
           </div>
         )}
-
-        <div className="mt-8 bg-blue-50 border border-blue-200 rounded-lg p-6">
-          <h3 className="font-semibold text-blue-900 mb-2">ℹ️ About Recordings</h3>
-          <ul className="text-sm text-blue-800 space-y-1">
-            <li>• Recordings are automatically saved when the teacher ends a recorded class</li>
-            <li>• Recordings are available for <strong>3 days</strong> after the class ends</li>
-            <li>• Download recordings before they expire</li>
-            <li>• Recordings include both video and audio from all participants</li>
-          </ul>
-        </div>
       </div>
     </main>
   )
