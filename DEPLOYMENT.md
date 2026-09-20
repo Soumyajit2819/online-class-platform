@@ -59,15 +59,10 @@ Go to **Storage → S3 Configuration**:
 
 ---
 
-## Step 2 — Deploy Backend (Railway)
+## Step 2 — Deploy Backend
 
-### 2A. Push to GitHub (if not done)
-```bash
-git remote add origin https://github.com/YOUR_USERNAME/online-class-platform.git
-git push -u origin main
-```
+### Option A: Railway (Recommended)
 
-### 2B. Create Railway project
 1. Go to https://railway.app
 2. New Project → Deploy from GitHub repo
 3. Select `online-class-platform`
@@ -76,37 +71,43 @@ git push -u origin main
    ```
    uvicorn app.main:app --host 0.0.0.0 --port $PORT
    ```
+6. Add all environment variables (see table below)
+7. Copy your Railway URL → needed for Vercel
 
-### 2C. Set backend environment variables in Railway
+---
 
-Go to your Railway service → **Variables** → Add all of these:
+### Option B: Render (Free Alternative)
 
-```env
-LIVEKIT_URL=wss://onlineclassplatform-v7ztr6qb.livekit.cloud
-LIVEKIT_API_KEY=your_livekit_api_key
-LIVEKIT_API_SECRET=your_livekit_api_secret
+1. Go to https://render.com
+2. New → **Web Service** → Connect GitHub
+3. Select `online-class-platform`
+4. Set:
+   - **Root Directory:** `backend`
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - **Python Version:** 3.11
+5. Add all environment variables (see table below)
+6. Click **Create Web Service**
+7. Copy your Render URL → needed for Vercel
 
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-SUPABASE_ANON_KEY=your_anon_key
+> ⚠️ Free tier on Render spins down after 15 minutes of inactivity.
+> First request after sleep takes ~30 seconds. Upgrade to $7/mo for always-on.
 
-SUPABASE_S3_ENDPOINT=https://your-project.supabase.co/storage/v1/s3
-SUPABASE_S3_ACCESS_KEY=your_s3_access_key
-SUPABASE_S3_SECRET_KEY=your_s3_secret_key
-SUPABASE_S3_REGION=ap-northeast-2
-SUPABASE_S3_BUCKET=class-recordings
+---
 
-FRONTEND_URL=https://your-app.vercel.app
-ADMIN_DASHBOARD_PASSWORD=YourStrongAdminPassword
-ENVIRONMENT=production
-```
+### Option C: Google Cloud Run (Production Scale)
 
-### 2D. Get your backend URL
-After deployment Railway gives you a URL like:
-```
-https://online-class-platform-production.up.railway.app
-```
-**Save this — you need it for the frontend.**
+1. Install [gcloud CLI](https://cloud.google.com/sdk/docs/install)
+2. From `backend/` folder:
+   ```bash
+   gcloud run deploy online-class-backend \
+     --source . \
+     --region asia-south1 \
+     --allow-unauthenticated \
+     --port 8080
+   ```
+3. Set environment variables in Cloud Run console
+4. Free tier: 2M requests/month
 
 ---
 
