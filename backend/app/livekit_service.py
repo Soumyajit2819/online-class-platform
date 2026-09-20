@@ -277,31 +277,37 @@ class LiveKitService:
 
     async def ensure_bucket_exists(self) -> bool:
         """Verify the Supabase bucket is accessible using signed S3 request."""
+        import asyncio
         try:
             import boto3
             from botocore.config import Config
             from botocore.exceptions import ClientError
 
-            s3 = boto3.client(
-                's3',
-                endpoint_url=self.s3_endpoint,
-                aws_access_key_id=self.s3_access_key,
-                aws_secret_access_key=self.s3_secret_key,
-                region_name=self.s3_region,
-                config=Config(signature_version='s3v4')
-            )
+            def _check():
+                s3 = boto3.client(
+                    's3',
+                    endpoint_url=self.s3_endpoint,
+                    aws_access_key_id=self.s3_access_key,
+                    aws_secret_access_key=self.s3_secret_key,
+                    region_name=self.s3_region,
+                    config=Config(signature_version='s3v4')
+                )
+                # head_bucket is lightest call — just checks if bucket exists
+                try:
+                    s3.head_bucket(Bucket=self.s3_bucket)
+                    return True, f"✓ Supabase bucket '{self.s3_bucket}' is ready for recordings"
+                except ClientError as e:
+                    code = e.response['Error']['Code']
+                    if code in ('403', '200'):
+                        # Bucket exists but may have restricted access — still OK
+                        return True, f"✓ Supabase bucket '{self.s3_bucket}' exists"
+                    return False, f"⚠ Bucket '{self.s3_bucket}' not found — create it in Supabase dashboard → Storage"
 
-            # List buckets to verify connection and bucket existence
-            response = s3.list_buckets()
-            buckets = [b['Name'] for b in response.get('Buckets', [])]
-
-            if self.s3_bucket in buckets:
-                print(f"✓ Supabase bucket '{self.s3_bucket}' is ready for recordings")
-                return True
-            else:
-                print(f"⚠ Bucket '{self.s3_bucket}' not found. Available: {buckets}")
-                print(f"  Please create bucket '{self.s3_bucket}' in Supabase dashboard → Storage")
-                return False
+            # Run synchronous boto3 call in thread pool to not block event loop
+            loop = asyncio.get_event_loop()
+            ok, msg = await loop.run_in_executor(None, _check)
+            print(msg)
+            return ok
 
         except ImportError:
             print("⚠ boto3 not installed — run: pip install boto3")
