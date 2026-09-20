@@ -2,6 +2,7 @@ import secrets
 import hashlib
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
+import aiohttp
 from livekit.api import AccessToken, VideoGrants
 from livekit.api.room_service import RoomService, CreateRoomRequest
 from .config import settings
@@ -137,15 +138,24 @@ class LiveKitService:
         self.url = settings.LIVEKIT_URL
         self.api_key = settings.LIVEKIT_API_KEY
         self.api_secret = settings.LIVEKIT_API_SECRET
+        self._session: Optional[aiohttp.ClientSession] = None
         self._room_service: Optional[RoomService] = None
     
-    @property
-    def room_service(self) -> RoomService:
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def get_room_service(self) -> RoomService:
+        """Get or create RoomService."""
         if self._room_service is None:
+            session = await self.get_session()
             self._room_service = RoomService(
-                self.url,
-                self.api_key,
-                self.api_secret
+                session=session,
+                url=self.url,
+                api_key=self.api_key,
+                api_secret=self.api_secret
             )
         return self._room_service
     
@@ -175,8 +185,9 @@ class LiveKitService:
     ) -> str:
         """Generate a LiveKit access token."""
         token = AccessToken(self.api_key, self.api_secret)
-        token.identity = identity
-        token.name = name
+        
+        # Set identity and name
+        token = token.with_identity(identity).with_name(name)
         
         # Add metadata for role identification
         metadata = f"role:{role}"
@@ -184,7 +195,7 @@ class LiveKitService:
             metadata += ",mic:muted"
         if is_camera_off:
             metadata += ",camera:off"
-        token.metadata = metadata
+        token = token.with_metadata(metadata)
         
         # Set video grants
         grants = VideoGrants(
@@ -194,10 +205,10 @@ class LiveKitService:
             can_subscribe=can_subscribe,
             can_publish_data=can_publish_data,
         )
-        token.add_grants(grants)
+        token = token.with_grants(grants)
         
         # Set token expiration (6 hours for MVP)
-        token.ttl = timedelta(hours=6)
+        token = token.with_ttl(timedelta(hours=6))
         
         return token.to_jwt()
     
@@ -208,7 +219,8 @@ class LiveKitService:
     ) -> bool:
         """Create a LiveKit room."""
         try:
-            await self.room_service.create_room(CreateRoomRequest(
+            room_service = await self.get_room_service()
+            await room_service.create_room(CreateRoomRequest(
                 name=livekit_room_name,
                 max_participants=max_participants,
             ))
@@ -222,7 +234,8 @@ class LiveKitService:
         """Delete a LiveKit room."""
         try:
             from livekit.api.room_service import DeleteRoomRequest
-            await self.room_service.delete_room(DeleteRoomRequest(room=livekit_room_name))
+            room_service = await self.get_room_service()
+            await room_service.delete_room(DeleteRoomRequest(room=livekit_room_name))
         except Exception as e:
             print(f"Room deletion note: {e}")
     
@@ -230,7 +243,8 @@ class LiveKitService:
         """Get list of participants in a room."""
         try:
             from livekit.api.room_service import ListParticipantsRequest
-            participants = await self.room_service.list_participants(ListParticipantsRequest(room=livekit_room_name))
+            room_service = await self.get_room_service()
+            participants = await room_service.list_participants(ListParticipantsRequest(room=livekit_room_name))
             return [
                 {
                     "identity": p.identity,
@@ -248,7 +262,8 @@ class LiveKitService:
         """Remove a participant from the room."""
         try:
             from livekit.api.room_service import RoomParticipantIdentity
-            await self.room_service.remove_participant(RoomParticipantIdentity(
+            room_service = await self.get_room_service()
+            await room_service.remove_participant(RoomParticipantIdentity(
                 room=livekit_room_name,
                 identity=identity,
             ))
@@ -259,7 +274,8 @@ class LiveKitService:
         """Mute/unmute a participant's microphone."""
         try:
             from livekit.api.room_service import MuteRoomTrackRequest
-            await self.room_service.mute_room_track(MuteRoomTrackRequest(
+            room_service = await self.get_room_service()
+            await room_service.mute_room_track(MuteRoomTrackRequest(
                 room=livekit_room_name,
                 identity=identity,
                 track_sid="microphone",
@@ -278,7 +294,8 @@ class LiveKitService:
         for identity in student_identities:
             try:
                 from livekit.api.room_service import MuteRoomTrackRequest
-                await self.room_service.mute_room_track(MuteRoomTrackRequest(
+                room_service = await self.get_room_service()
+                await room_service.mute_room_track(MuteRoomTrackRequest(
                     room=livekit_room_name,
                     identity=identity,
                     track_sid="camera",
