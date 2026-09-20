@@ -53,12 +53,20 @@ async def startup_event():
 
 
 async def _cleanup_loop():
-    """Hourly cleanup of expired in-memory recording metadata."""
+    """Hourly cleanup: removes expired in-memory metadata AND deletes files from Supabase S3."""
     while True:
-        await asyncio.sleep(3600)
-        expired = recording_state.cleanup_expired()
-        if expired:
-            print(f"✓ Cleaned up {len(expired)} expired recording entries")
+        await asyncio.sleep(3600)  # run every hour
+        try:
+            # 1. Clean expired in-memory metadata
+            expired = recording_state.cleanup_expired()
+            if expired:
+                print(f"✓ Cleaned up {len(expired)} expired recording entries from memory")
+
+            # 2. Delete expired files from Supabase S3
+            await livekit_service.delete_expired_recordings_from_storage()
+
+        except Exception as e:
+            print(f"✗ Error in cleanup task: {e}")
 
 
 # ---------------------------------------------------------------------------

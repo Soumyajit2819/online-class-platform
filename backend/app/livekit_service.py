@@ -497,7 +497,33 @@ class LiveKitService:
 
         return await self._run_in_thread(_fetch)
 
-    async def generate_download_url(self, s3_key: str) -> Optional[str]:
+    async def delete_expired_recordings_from_storage(self):
+        """Delete files older than 3 days from Supabase S3 bucket."""
+        def _delete():
+            try:
+                from datetime import timezone
+                s3        = self._s3_client()
+                paginator = s3.get_paginator('list_objects_v2')
+                deleted   = []
+
+                for page in paginator.paginate(Bucket=self.s3_bucket, Prefix='recordings/'):
+                    for obj in page.get('Contents', []):
+                        key           = obj['Key']
+                        last_modified = obj['LastModified']  # tz-aware
+                        expires_at    = last_modified + timedelta(days=3)
+                        now_utc       = datetime.now(timezone.utc)
+
+                        if expires_at <= now_utc:
+                            s3.delete_object(Bucket=self.s3_bucket, Key=key)
+                            deleted.append(key)
+                            print(f"✓ Deleted expired recording from Supabase: {key}")
+
+                return deleted
+            except Exception as e:
+                print(f"⚠ Error deleting expired recordings: {e}")
+                return []
+
+        return await self._run_in_thread(_delete)
         """Generate a fresh pre-signed download URL."""
         def _gen():
             try:
