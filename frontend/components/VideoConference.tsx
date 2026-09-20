@@ -81,6 +81,8 @@ function ClassroomContent({
   const [isEnded, setIsEnded] = useState(false)
   const [micPolicy, setMicPolicy] = useState<'allowed' | 'muted_by_default' | 'locked'>('allowed')
   const [cameraPolicy, setCameraPolicy] = useState<'allowed' | 'off_by_default' | 'locked'>('allowed')
+  const [isRecording, setIsRecording] = useState(false)
+  const [activeRecordingId, setActiveRecordingId] = useState<string | null>(null)
 
   const teacherIdentity = localParticipant.localParticipant?.identity || ''
 
@@ -194,9 +196,15 @@ function ClassroomContent({
               teacherIdentity={teacherIdentity}
               participants={participantsList}
               isLocked={isLocked}
+              isRecording={isRecording}
+              activeRecordingId={activeRecordingId}
               micPolicy={micPolicy}
               cameraPolicy={cameraPolicy}
               onLockChange={setIsLocked}
+              onRecordingChange={(recording, recordingId) => {
+                setIsRecording(recording)
+                setActiveRecordingId(recordingId)
+              }}
               onMicPolicyChange={setMicPolicy}
               onCameraPolicyChange={setCameraPolicy}
               onRefresh={fetchParticipants}
@@ -246,9 +254,12 @@ function TeacherControls({
   teacherIdentity,
   participants,
   isLocked,
+  isRecording,
+  activeRecordingId,
   micPolicy,
   cameraPolicy,
   onLockChange,
+  onRecordingChange,
   onMicPolicyChange,
   onCameraPolicyChange,
   onRefresh,
@@ -258,9 +269,12 @@ function TeacherControls({
   teacherIdentity: string
   participants: ApiParticipant[]
   isLocked: boolean
+  isRecording: boolean
+  activeRecordingId: string | null
   micPolicy: 'allowed' | 'muted_by_default' | 'locked'
   cameraPolicy: 'allowed' | 'off_by_default' | 'locked'
   onLockChange: (locked: boolean) => void
+  onRecordingChange: (recording: boolean, recordingId: string | null) => void
   onMicPolicyChange: (policy: 'allowed' | 'muted_by_default' | 'locked') => void
   onCameraPolicyChange: (policy: 'allowed' | 'off_by_default' | 'locked') => void
   onRefresh: () => void
@@ -370,6 +384,15 @@ function TeacherControls({
   const handleEndClass = async () => {
     if (!confirm('End this class for everyone? This cannot be undone.')) return
     try {
+      // Stop recording if active
+      if (isRecording && activeRecordingId) {
+        await api.stopRecording({
+          room_code: roomCode,
+          recording_id: activeRecordingId,
+          teacher_identity: teacherIdentity,
+        })
+      }
+      
       await api.endClass({
         room_code: roomCode,
         teacher_identity: teacherIdentity,
@@ -381,12 +404,48 @@ function TeacherControls({
     }
   }
 
+  const handleStartRecording = async () => {
+    if (!confirm('Start recording this class?')) return
+    try {
+      const result = await api.startRecording({
+        room_code: roomCode,
+        teacher_identity: teacherIdentity,
+      })
+      onRecordingChange(true, result.recording_id)
+      alert('Recording started successfully!')
+    } catch (err: any) {
+      alert(err.message || 'Failed to start recording')
+    }
+  }
+
+  const handleStopRecording = async () => {
+    if (!activeRecordingId) return
+    if (!confirm('Stop recording? The recording will be saved and available for download.')) return
+    try {
+      const result = await api.stopRecording({
+        room_code: roomCode,
+        recording_id: activeRecordingId,
+        teacher_identity: teacherIdentity,
+      })
+      onRecordingChange(false, null)
+      alert('Recording stopped and saved successfully!')
+    } catch (err: any) {
+      alert(err.message || 'Failed to stop recording')
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto p-4">
       <h2 className="text-lg font-semibold text-white mb-4">Teacher Controls</h2>
 
       {/* Quick actions */}
       <div className="space-y-2 mb-6">
+        <button
+          onClick={isRecording ? handleStopRecording : handleStartRecording}
+          className={`w-full py-2 ${isRecording ? 'bg-red-700 hover:bg-red-800 animate-pulse' : 'bg-red-600 hover:bg-red-700'} text-white rounded-lg transition-colors text-sm`}
+        >
+          {isRecording ? '⏹ Stop Recording' : '⏺ Start Recording'}
+        </button>
         <button
           onClick={handleMuteAll}
           className="w-full py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition-colors text-sm"

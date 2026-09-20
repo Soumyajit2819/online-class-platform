@@ -5,8 +5,92 @@ from datetime import datetime, timedelta
 import aiohttp
 from livekit.api import AccessToken, VideoGrants
 from livekit.api.room_service import RoomService, CreateRoomRequest
+from livekit.api.egress_service import EgressService, RoomCompositeEgressRequest
+from livekit.api import EncodedFileOutput, EncodedFileType
 from .config import settings
 from .models import MicrophonePolicy, CameraPolicy
+
+
+class RecordingState:
+    """In-memory state for class recordings."""
+    
+    def __init__(self):
+        self.recordings: Dict[str, Dict[str, Any]] = {}  # recording_id -> recording_info
+        self.class_recordings: Dict[str, List[str]] = {}  # room_code -> [recording_ids]
+    
+    def add_recording(
+        self,
+        room_code: str,
+        recording_id: str,
+        egress_id: str,
+        livekit_room_name: str,
+        class_name: str,
+        teacher_name: str,
+    ):
+        """Add a new recording."""
+        now = datetime.utcnow()
+        expiry = now + timedelta(days=3)
+        
+        self.recordings[recording_id] = {
+            "recording_id": recording_id,
+            "egress_id": egress_id,
+            "room_code": room_code,
+            "livekit_room_name": livekit_room_name,
+            "class_name": class_name,
+            "teacher_name": teacher_name,
+            "status": "starting",  # starting, recording, paused, ended, processing, available, failed
+            "started_at": now,
+            "ended_at": None,
+            "expires_at": expiry,
+            "duration_seconds": 0,
+            "download_url": None,
+            "file_size": 0,
+        }
+        
+        if room_code not in self.class_recordings:
+            self.class_recordings[room_code] = []
+        self.class_recordings[room_code].append(recording_id)
+    
+    def get_recording(self, recording_id: str) -> Optional[Dict[str, Any]]:
+        return self.recordings.get(recording_id)
+    
+    def update_recording_status(self, recording_id: str, status: str, **kwargs):
+        """Update recording status and other fields."""
+        if recording_id in self.recordings:
+            self.recordings[recording_id]["status"] = status
+            for key, value in kwargs.items():
+                if key in self.recordings[recording_id]:
+                    self.recordings[recording_id][key] = value
+    
+    def get_class_recordings(self, room_code: str) -> List[Dict[str, Any]]:
+        """Get all recordings for a class."""
+        recording_ids = self.class_recordings.get(room_code, [])
+        return [self.recordings[rid] for rid in recording_ids if rid in self.recordings]
+    
+    def get_available_recordings(self) -> List[Dict[str, Any]]:
+        """Get all available recordings that haven't expired."""
+        now = datetime.utcnow()
+        available = []
+        for recording in self.recordings.values():
+            if recording["status"] == "available" and recording["expires_at"] > now:
+                available.append(recording)
+        return available
+    
+    def cleanup_expired_recordings(self) -> List[str]:
+        """Remove expired recordings and return their IDs."""
+        now = datetime.utcnow()
+        expired_ids = []
+        for recording_id, recording in list(self.recordings.items()):
+            if recording["expires_at"] <= now:
+                expired_ids.append(recording_id)
+                del self.recordings[recording_id]
+                # Remove from class_recordings
+                room_code = recording["room_code"]
+                if room_code in self.class_recordings:
+                    self.class_recordings[room_code] = [
+                        rid for rid in self.class_recordings[room_code] if rid != recording_id
+                    ]
+        return expired_ids
 
 
 class SessionState:
@@ -40,6 +124,8 @@ class SessionState:
             "student_camera_policy": student_camera_policy,
             "is_locked": False,
             "is_ended": False,
+            "is_recording": False,
+            "active_recording_id": None,
             "created_at": datetime.utcnow(),
         }
         self.teacher_sessions[teacher_identity] = room_code
@@ -54,6 +140,16 @@ class SessionState:
     def is_class_locked(self, room_code: str) -> bool:
         class_info = self.get_class(room_code)
         return class_info.get("is_locked", False) if class_info else False
+    
+    def is_recording(self, room_code: str) -> bool:
+        class_info = self.get_class(room_code)
+        return class_info.get("is_recording", False) if class_info else False
+    
+    def set_recording(self, room_code: str, is_recording: bool, recording_id: Optional[str] = None):
+        class_info = self.get_class(room_code)
+        if class_info:
+            class_info["is_recording"] = is_recording
+            class_info["active_recording_id"] = recording_id
     
     def lock_class(self, room_code: str):
         class_info = self.get_class(room_code)
@@ -129,6 +225,7 @@ class SessionState:
 
 # Global session state
 session_state = SessionState()
+recording_state = RecordingState()
 
 
 class LiveKitService:
@@ -140,6 +237,7 @@ class LiveKitService:
         self.api_secret = settings.LIVEKIT_API_SECRET
         self._session: Optional[aiohttp.ClientSession] = None
         self._room_service: Optional[RoomService] = None
+        self._egress_service: Optional[EgressService] = None
     
     async def get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
@@ -159,6 +257,18 @@ class LiveKitService:
             )
         return self._room_service
     
+    async def get_egress_service(self) -> EgressService:
+        """Get or create EgressService."""
+        if self._egress_service is None:
+            session = await self.get_session()
+            self._egress_service = EgressService(
+                session=session,
+                url=self.url,
+                api_key=self.api_key,
+                api_secret=self.api_secret
+            )
+        return self._egress_service
+    
     def generate_room_code(self) -> str:
         """Generate a unique application-level room code."""
         return secrets.token_urlsafe(6).upper()
@@ -166,6 +276,10 @@ class LiveKitService:
     def generate_livekit_room_name(self) -> str:
         """Generate a secure LiveKit room name."""
         return f"class_{secrets.token_urlsafe(16)}"
+    
+    def generate_recording_id(self) -> str:
+        """Generate a unique recording ID."""
+        return f"rec_{secrets.token_urlsafe(8)}"
     
     def hash_passcode(self, passcode: str) -> str:
         """Hash a meeting passcode for storage."""
@@ -303,6 +417,156 @@ class LiveKitService:
                 ))
             except Exception as e:
                 print(f"Error disabling camera for {identity}: {e}")
+    
+    # Recording methods
+    
+    async def start_recording(
+        self,
+        room_code: str,
+        livekit_room_name: str,
+        class_name: str,
+        teacher_name: str,
+    ) -> Dict[str, Any]:
+        """Start recording a class."""
+        try:
+            recording_id = self.generate_recording_id()
+            egress_service = await self.get_egress_service()
+            
+            # Create room composite egress request for recording
+            # This records all participants' video and audio
+            request = RoomCompositeEgressRequest(
+                room_name=livekit_room_name,
+                # Output to MP4 file
+                file=EncodedFileOutput(
+                    file_type=EncodedFileType.MP4,
+                    filepath=f"recordings/{room_code}/{recording_id}.mp4",
+                    # For MVP, we'll use LiveKit's built-in storage
+                    # In production, you'd configure S3/GCP/Azure upload
+                    # s3=S3Upload(...) if you have S3 configured
+                )
+            )
+            
+            # Start the egress
+            egress_info = await egress_service.start_room_composite_egress(request)
+            
+            # Store recording state
+            recording_state.add_recording(
+                room_code=room_code,
+                recording_id=recording_id,
+                egress_id=egress_info.egress_id,
+                livekit_room_name=livekit_room_name,
+                class_name=class_name,
+                teacher_name=teacher_name,
+            )
+            
+            # Update class state
+            session_state.set_recording(room_code, True, recording_id)
+            
+            return {
+                "success": True,
+                "recording_id": recording_id,
+                "egress_id": egress_info.egress_id,
+                "status": "recording",
+            }
+        except Exception as e:
+            print(f"Error starting recording: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+    
+    async def stop_recording(self, room_code: str, recording_id: str) -> Dict[str, Any]:
+        """Stop recording a class."""
+        try:
+            recording = recording_state.get_recording(recording_id)
+            if not recording:
+                return {"success": False, "error": "Recording not found"}
+            
+            egress_service = await self.get_egress_service()
+            
+            # Stop the egress
+            from livekit.api.egress_service import StopEgressRequest
+            egress_info = await egress_service.stop_egress(StopEgressRequest(
+                egress_id=recording["egress_id"]
+            ))
+            
+            # Update recording state
+            recording_state.update_recording_status(
+                recording_id,
+                status="ended",
+                ended_at=datetime.utcnow(),
+                download_url=egress_info.file.location if hasattr(egress_info, 'file') else None,
+            )
+            
+            # Update class state
+            session_state.set_recording(room_code, False, None)
+            
+            return {
+                "success": True,
+                "recording_id": recording_id,
+                "status": "ended",
+                "download_url": egress_info.file.location if hasattr(egress_info, 'file') else None,
+            }
+        except Exception as e:
+            print(f"Error stopping recording: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+    
+    async def get_recording_status(self, recording_id: str) -> Dict[str, Any]:
+        """Get the status of a recording."""
+        try:
+            recording = recording_state.get_recording(recording_id)
+            if not recording:
+                return {"success": False, "error": "Recording not found"}
+            
+            # If recording is active, check LiveKit status
+            if recording["status"] in ["starting", "recording", "paused"]:
+                egress_service = await self.get_egress_service()
+                from livekit.api.egress_service import ListEgressRequest
+                egress_list = await egress_service.list_egress(ListEgressRequest(
+                    room_name=recording["livekit_room_name"],
+                    egress_id=recording["egress_id"],
+                ))
+                
+                if egress_list.items:
+                    egress_info = egress_list.items[0]
+                    # Update status based on LiveKit response
+                    status_map = {
+                        "EGRESS_STARTING": "starting",
+                        "EGRESS_ACTIVE": "recording",
+                        "EGRESS_ENDING": "ending",
+                        "EGRESS_COMPLETE": "available",
+                        "EGRESS_FAILED": "failed",
+                        "EGRESS_ABORTED": "failed",
+                    }
+                    new_status = status_map.get(egress_info.status.name, recording["status"])
+                    
+                    recording_state.update_recording_status(
+                        recording_id,
+                        status=new_status,
+                        download_url=egress_info.file.location if hasattr(egress_info, 'file') and egress_info.file else None,
+                    )
+            
+            return {
+                "success": True,
+                "recording": recording_state.get_recording(recording_id),
+            }
+        except Exception as e:
+            print(f"Error getting recording status: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+    
+    def get_class_recordings(self, room_code: str) -> List[Dict[str, Any]]:
+        """Get all recordings for a class."""
+        return recording_state.get_class_recordings(room_code)
+    
+    def get_all_available_recordings(self) -> List[Dict[str, Any]]:
+        """Get all available recordings."""
+        return recording_state.get_available_recordings()
 
 
 # Global LiveKit service instance

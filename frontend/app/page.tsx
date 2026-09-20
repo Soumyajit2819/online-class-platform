@@ -26,6 +26,12 @@ export default function Home() {
           >
             Student
           </Link>
+          <Link
+            href="/recordings"
+            className="px-8 py-4 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg shadow-lg transition-all duration-200 transform hover:scale-105"
+          >
+            📹 Recordings
+          </Link>
         </div>
         
         <div className="mt-16 p-6 bg-white rounded-lg shadow-md">

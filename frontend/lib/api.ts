@@ -61,6 +61,33 @@ export interface SetPolicyRequest {
   camera_policy?: 'allowed' | 'off_by_default' | 'locked';
 }
 
+export interface StartRecordingRequest {
+  room_code: string;
+  teacher_identity: string;
+}
+
+export interface StopRecordingRequest {
+  room_code: string;
+  recording_id: string;
+  teacher_identity: string;
+}
+
+export interface Recording {
+  recording_id: string;
+  egress_id: string;
+  room_code: string;
+  livekit_room_name: string;
+  class_name: string;
+  teacher_name: string;
+  status: string;
+  started_at: string;
+  ended_at: string | null;
+  expires_at: string;
+  duration_seconds: number;
+  download_url: string | null;
+  file_size: number;
+}
+
 class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -178,6 +205,37 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     });
+  },
+
+  // Recording endpoints
+  async startRecording(data: StartRecordingRequest): Promise<{ success: boolean; recording_id: string; egress_id: string; status: string }> {
+    return fetchApi('/api/teacher/start-recording', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  async stopRecording(data: StopRecordingRequest): Promise<{ success: boolean; recording_id: string; status: string; download_url: string | null }> {
+    return fetchApi('/api/teacher/stop-recording', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+
+  async getClassRecordings(roomCode: string): Promise<{ room_code: string; class_name: string; recordings: Recording[] }> {
+    return fetchApi(`/api/class/${roomCode}/recordings`);
+  },
+
+  async getAllRecordings(): Promise<{ recordings: Recording[]; total: number }> {
+    return fetchApi('/api/recordings');
+  },
+
+  async getRecordingStatus(recordingId: string): Promise<{ success: boolean; recording: Recording }> {
+    return fetchApi(`/api/recording/${recordingId}`);
+  },
+
+  async getRecordingDownloadUrl(recordingId: string): Promise<{ recording_id: string; download_url: string; expires_at: string }> {
+    return fetchApi(`/api/recording/${recordingId}/download`);
   },
 
   // Student endpoints

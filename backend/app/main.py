@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, List
 import secrets
+import asyncio
+from datetime import datetime
 
 from .config import settings
 from .models import (
@@ -13,10 +15,12 @@ from .models import (
     SetPolicyRequest,
     LockClassRequest,
     EndClassRequest,
+    StartRecordingRequest,
+    StopRecordingRequest,
     MicrophonePolicy,
     CameraPolicy,
 )
-from .livekit_service import livekit_service, session_state
+from .livekit_service import livekit_service, session_state, recording_state
 
 # Create FastAPI app
 app = FastAPI(
@@ -44,6 +48,9 @@ async def startup_event():
     except ValueError as e:
         print(f"⚠ Configuration warning: {e}")
         print("  Some features may not work correctly without proper LiveKit credentials")
+    
+    # Start background cleanup task for expired recordings
+    asyncio.create_task(cleanup_expired_recordings_task())
 
 
 # Health check endpoint
@@ -455,3 +462,145 @@ async def unblock_participant(request: ModerationRequest):
         session_state.unblock_participant(request.room_code.upper(), request.target_identity)
     
     return {"success": True, "message": f"Participant {request.target_identity} unblocked"}
+
+
+
+# Recording endpoints
+
+@app.post("/api/teacher/start-recording")
+async def start_recording(request: StartRecordingRequest):
+    """Start recording the class."""
+    class_info = session_state.get_class(request.room_code.upper())
+    if not class_info:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    # Verify this is the teacher
+    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
+        raise HTTPException(status_code=403, detail="Only the teacher can start recording")
+    
+    # Check if already recording
+    if session_state.is_recording(request.room_code.upper()):
+        raise HTTPException(status_code=400, detail="Class is already being recorded")
+    
+    result = await livekit_service.start_recording(
+        room_code=request.room_code.upper(),
+        livekit_room_name=class_info["livekit_room_name"],
+        class_name=class_info["class_name"],
+        teacher_name=class_info["teacher_name"],
+    )
+    
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Failed to start recording"))
+    
+    return result
+
+
+@app.post("/api/teacher/stop-recording")
+async def stop_recording(request: StopRecordingRequest):
+    """Stop recording the class."""
+    class_info = session_state.get_class(request.room_code.upper())
+    if not class_info:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    # Verify this is the teacher
+    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
+        raise HTTPException(status_code=403, detail="Only the teacher can stop recording")
+    
+    result = await livekit_service.stop_recording(
+        room_code=request.room_code.upper(),
+        recording_id=request.recording_id,
+    )
+    
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Failed to stop recording"))
+    
+    return result
+
+
+@app.get("/api/class/{room_code}/recordings")
+async def get_class_recordings(room_code: str):
+    """Get all recordings for a class."""
+    class_info = session_state.get_class(room_code.upper())
+    if not class_info:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    recordings = livekit_service.get_class_recordings(room_code.upper())
+    
+    return {
+        "room_code": room_code,
+        "class_name": class_info["class_name"],
+        "recordings": recordings,
+    }
+
+
+@app.get("/api/recordings")
+async def get_all_recordings():
+    """Get all available recordings."""
+    recordings = livekit_service.get_all_available_recordings()
+    return {
+        "recordings": recordings,
+        "total": len(recordings),
+    }
+
+
+@app.get("/api/recording/{recording_id}")
+async def get_recording_status(recording_id: str):
+    """Get the status of a specific recording."""
+    result = await livekit_service.get_recording_status(recording_id)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=404, detail=result.get("error", "Recording not found"))
+    
+    return result
+
+
+@app.get("/api/recording/{recording_id}/download")
+async def get_recording_download_url(recording_id: str):
+    """Get download URL for a recording."""
+    result = await livekit_service.get_recording_status(recording_id)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=404, detail=result.get("error", "Recording not found"))
+    
+    recording = result["recording"]
+    
+    if recording["status"] != "available":
+        raise HTTPException(status_code=400, detail="Recording is not yet available for download")
+    
+    if not recording["download_url"]:
+        raise HTTPException(status_code=404, detail="Download URL not available")
+    
+    return {
+        "recording_id": recording_id,
+        "download_url": recording["download_url"],
+        "expires_at": recording["expires_at"].isoformat() if recording.get("expires_at") else None,
+    }
+
+
+
+# Background task for cleaning up expired recordings
+async def cleanup_expired_recordings_task():
+    """Background task that runs every hour to clean up expired recordings."""
+    while True:
+        try:
+            # Sleep for 1 hour
+            await asyncio.sleep(3600)
+            
+            # Cleanup expired recordings
+            expired_ids = recording_state.cleanup_expired_recordings()
+            if expired_ids:
+                print(f"✓ Cleaned up {len(expired_ids)} expired recordings: {', '.join(expired_ids)}")
+        except Exception as e:
+            print(f"✗ Error in cleanup task: {e}")
+
+
+# Manual cleanup endpoint (for testing/admin)
+@app.post("/api/admin/cleanup-recordings")
+async def cleanup_recordings():
+    """Manually trigger cleanup of expired recordings."""
+    expired_ids = recording_state.cleanup_expired_recordings()
+    return {
+        "success": True,
+        "cleaned_count": len(expired_ids),
+        "cleaned_ids": expired_ids,
+    }

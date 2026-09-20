@@ -63,3 +63,14 @@ class LockClassRequest(BaseModel):
 class EndClassRequest(BaseModel):
     room_code: str
     teacher_identity: str
+
+
+class StartRecordingRequest(BaseModel):
+    room_code: str
+    teacher_identity: str
+
+
+class StopRecordingRequest(BaseModel):
+    room_code: str
+    recording_id: str
+    teacher_identity: str
