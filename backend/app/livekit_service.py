@@ -276,57 +276,38 @@ class LiveKitService:
         return self._egress_service
 
     async def ensure_bucket_exists(self) -> bool:
-        """Auto-create the Supabase bucket if it doesn't exist."""
-        # Extract project ref from endpoint URL
-        # e.g. https://mwwqohovmkwulojfsczn.storage.supabase.co/storage/v1/s3
+        """Verify the Supabase bucket is accessible using signed S3 request."""
         try:
-            # Supabase REST API endpoint for storage management
-            # Derive base URL from S3 endpoint
-            # https://mwwqohovmkwulojfsczn.storage.supabase.co/storage/v1/s3
-            # →  https://mwwqohovmkwulojfsczn.supabase.co
-            s3_endpoint = self.s3_endpoint  # e.g. https://xxx.storage.supabase.co/storage/v1/s3
-            # Extract project host
-            # xxx.storage.supabase.co → xxx.supabase.co
-            host = s3_endpoint.replace("https://", "").split("/")[0]  # xxx.storage.supabase.co
-            project_ref = host.split(".")[0]  # xxx
-            api_base = f"https://{project_ref}.supabase.co/storage/v1"
+            import boto3
+            from botocore.config import Config
+            from botocore.exceptions import ClientError
 
-            # Use Supabase service role key to create bucket
-            # We derive it from S3 credentials — for Supabase, secret_key IS the service role key
-            headers = {
-                "Authorization": f"Bearer {self.s3_secret_key}",
-                "Content-Type": "application/json",
-                "apikey": self.s3_secret_key,
-            }
+            s3 = boto3.client(
+                's3',
+                endpoint_url=self.s3_endpoint,
+                aws_access_key_id=self.s3_access_key,
+                aws_secret_access_key=self.s3_secret_key,
+                region_name=self.s3_region,
+                config=Config(signature_version='s3v4')
+            )
 
-            session = await self.get_session()
+            # List buckets to verify connection and bucket existence
+            response = s3.list_buckets()
+            buckets = [b['Name'] for b in response.get('Buckets', [])]
 
-            # First check if bucket already exists
-            async with session.get(f"{api_base}/bucket/{self.s3_bucket}", headers=headers) as resp:
-                if resp.status == 200:
-                    print(f"✓ Supabase bucket '{self.s3_bucket}' already exists")
-                    return True
+            if self.s3_bucket in buckets:
+                print(f"✓ Supabase bucket '{self.s3_bucket}' is ready for recordings")
+                return True
+            else:
+                print(f"⚠ Bucket '{self.s3_bucket}' not found. Available: {buckets}")
+                print(f"  Please create bucket '{self.s3_bucket}' in Supabase dashboard → Storage")
+                return False
 
-            # Bucket doesn't exist — create it
-            payload = {
-                "id": self.s3_bucket,
-                "name": self.s3_bucket,
-                "public": True,
-                "allowed_mime_types": ["video/mp4", "video/*"],
-                "file_size_limit": 5368709120  # 5GB
-            }
-            async with session.post(f"{api_base}/bucket", json=payload, headers=headers) as resp:
-                if resp.status in (200, 201):
-                    print(f"✓ Supabase bucket '{self.s3_bucket}' created successfully")
-                    return True
-                else:
-                    body = await resp.text()
-                    print(f"⚠ Could not create bucket: {resp.status} - {body}")
-                    print(f"  Please manually create bucket '{self.s3_bucket}' in Supabase dashboard")
-                    return False
+        except ImportError:
+            print("⚠ boto3 not installed — run: pip install boto3")
+            return False
         except Exception as e:
-            print(f"⚠ Bucket check/create error: {e}")
-            print(f"  Please manually create bucket '{self.s3_bucket}' in Supabase dashboard")
+            print(f"⚠ Storage check error: {e}")
             return False
     
     def generate_room_code(self) -> str:
