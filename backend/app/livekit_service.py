@@ -434,13 +434,13 @@ class LiveKitService:
             
             # Create room composite egress request for recording
             # This records all participants' video and audio
+            # Use "file" field (singular) for single file output
             request = RoomCompositeEgressRequest(
                 room_name=livekit_room_name,
-                # Output to MP4 file - use file_outputs as a list
-                file_outputs=[EncodedFileOutput(
+                file=EncodedFileOutput(
                     file_type=EncodedFileType.MP4,
                     filepath=f"recordings/{room_code}/{recording_id}.mp4"
-                )]
+                )
             )
             
             # Start the egress
