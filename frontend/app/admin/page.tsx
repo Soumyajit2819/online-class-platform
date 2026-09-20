@@ -31,11 +31,11 @@ function AdminLogin({ onLogin }: { onLogin: (pw: string) => void }) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-950 p-8">
-      <div className="w-full max-w-sm bg-gray-900 rounded-2xl shadow-2xl p-8 border border-gray-700">
+    <div className="min-h-screen flex items-center justify-center bg-gray-950 p-4 sm:p-8">
+      <div className="w-full max-w-sm bg-gray-900 rounded-2xl shadow-2xl p-6 sm:p-8 border border-gray-700">
         <div className="text-center mb-6">
-          <div className="text-5xl mb-3">🛡️</div>
-          <h1 className="text-2xl font-bold text-white">Admin Dashboard</h1>
+          <div className="text-4xl sm:text-5xl mb-3">🛡️</div>
+          <h1 className="text-xl sm:text-2xl font-bold text-white">Admin Dashboard</h1>
           <p className="text-gray-400 text-sm mt-1">Restricted access</p>
         </div>
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -56,7 +56,7 @@ function AdminLogin({ onLogin }: { onLogin: (pw: string) => void }) {
             placeholder="Admin password"
           />
           {error && (
-            <div className="p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-300 text-sm">
+            <div className="p-3 bg-red-900/50 border border-red-700 rounded-lg text-red-300 text-sm break-words">
               ⚠️ {error}
             </div>
           )}
@@ -66,7 +66,7 @@ function AdminLogin({ onLogin }: { onLogin: (pw: string) => void }) {
           </button>
         </form>
         <div className="mt-4 text-center">
-          <Link href="/" className="text-gray-500 hover:text-gray-300 text-sm">← Back to Home</Link>
+          <Link href="/" className="inline-block py-2 px-2 text-gray-500 hover:text-gray-300 text-sm">← Back to Home</Link>
         </div>
       </div>
     </div>
@@ -117,12 +117,12 @@ function UpdatePasscodeCard({
   }
 
   return (
-    <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
-      <div className="flex items-center gap-3 mb-4">
-        <span className="text-3xl">{icon}</span>
-        <div>
-          <h3 className="text-lg font-semibold text-white">{title}</h3>
-          <p className="text-gray-400 text-sm">{description}</p>
+    <div className="bg-gray-800 rounded-xl p-4 sm:p-6 border border-gray-700">
+      <div className="flex items-start sm:items-center gap-3 mb-4">
+        <span className="text-2xl sm:text-3xl shrink-0">{icon}</span>
+        <div className="min-w-0">
+          <h3 className="text-base sm:text-lg font-semibold text-white break-words">{title}</h3>
+          <p className="text-gray-400 text-sm break-words">{description}</p>
         </div>
       </div>
 
@@ -138,7 +138,7 @@ function UpdatePasscodeCard({
             data-form-type="other"
             data-lpignore="true"
             data-1p-ignore="true"
-            className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 text-sm"
+            className="w-full px-4 py-2.5 sm:py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 text-sm"
             placeholder="Min 6 characters"
           />
         </div>
@@ -153,16 +153,16 @@ function UpdatePasscodeCard({
             data-form-type="other"
             data-lpignore="true"
             data-1p-ignore="true"
-            className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 text-sm"
+            className="w-full px-4 py-2.5 sm:py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 text-sm"
             placeholder="Confirm passcode"
           />
         </div>
 
-        {error   && <p className="text-red-400 text-sm">⚠️ {error}</p>}
-        {success && <p className="text-green-400 text-sm">✅ {success}</p>}
+        {error   && <p className="text-red-400 text-sm break-words">⚠️ {error}</p>}
+        {success && <p className="text-green-400 text-sm break-words">✅ {success}</p>}
 
         <button type="submit" disabled={loading}
-          className="w-full py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white font-medium rounded-lg transition-colors text-sm">
+          className="w-full py-3 sm:py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white font-medium rounded-lg transition-colors text-sm">
           {loading ? 'Updating...' : 'Update Passcode'}
         </button>
       </form>
@@ -195,23 +195,23 @@ function AdminDashboard({ adminPassword }: { adminPassword: string }) {
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 p-8">
+    <div className="min-h-screen bg-gray-950 p-4 sm:p-8">
       <div className="max-w-2xl mx-auto">
         {/* Header */}
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-3xl font-bold text-white">Admin Dashboard</h1>
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-6 sm:mb-8">
+          <div className="min-w-0">
+            <h1 className="text-2xl sm:text-3xl font-bold text-white">Admin Dashboard</h1>
             <p className="text-gray-400 mt-1">Manage access passcodes</p>
           </div>
           <Link href="/"
-            className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm border border-gray-700 transition-colors">
+            className="shrink-0 px-4 py-2.5 sm:py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm border border-gray-700 transition-colors">
             ← Home
           </Link>
         </div>
 
         {/* Status cards */}
         {status && (
-          <div className="grid grid-cols-3 gap-4 mb-8">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4 mb-6 sm:mb-8">
             {[
               { label: 'Teacher Passcode', set: status.teacher_passcode_set },
               { label: 'Recordings Passcode', set: status.recordings_passcode_set },
@@ -231,7 +231,7 @@ function AdminDashboard({ adminPassword }: { adminPassword: string }) {
         )}
 
         {/* Passcode update cards */}
-        <div className="space-y-6">
+        <div className="space-y-4 sm:space-y-6">
           <UpdatePasscodeCard
             title="Teacher Access Passcode"
             icon="👨‍🏫"
@@ -249,9 +249,9 @@ function AdminDashboard({ adminPassword }: { adminPassword: string }) {
         </div>
 
         {/* Security note */}
-        <div className="mt-8 bg-yellow-900/30 border border-yellow-700/50 rounded-xl p-4">
+        <div className="mt-6 sm:mt-8 bg-yellow-900/30 border border-yellow-700/50 rounded-xl p-4">
           <p className="text-yellow-300 text-sm font-semibold mb-2">🔐 Security Notes</p>
-          <ul className="text-yellow-200/80 text-xs space-y-1">
+          <ul className="text-yellow-200/80 text-xs space-y-1 break-words">
             <li>• Passcodes are stored as SHA-256 hashes in Supabase — never as plain text</li>
             <li>• Admin password is stored in backend <code className="bg-gray-800 px-1 rounded">.env</code> file only</li>
             <li>• After 5 failed attempts, users are locked out for 30 seconds</li>

@@ -39,9 +39,9 @@ export default function StudentPage() {
   }
 
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-green-50 to-emerald-100 p-8">
-      <div className="max-w-md w-full bg-white rounded-lg shadow-xl p-8">
-        <h2 className="text-2xl font-bold text-gray-900 mb-6 text-center">
+    <main className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-green-50 to-emerald-100 p-4 sm:p-8">
+      <div className="max-w-md w-full bg-white rounded-lg shadow-xl p-5 sm:p-8">
+        <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-6 text-center">
           Join a Class
         </h2>
         
@@ -55,7 +55,7 @@ export default function StudentPage() {
               id="studentName"
               value={studentName}
               onChange={(e) => setStudentName(e.target.value)}
-              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:border-green-500"
+              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:border-green-500"
               placeholder="Enter your name"
               required
             />
@@ -70,7 +70,7 @@ export default function StudentPage() {
               id="roomCode"
               value={roomCode}
               onChange={(e) => setRoomCode(e.target.value.toUpperCase())}
-              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:border-green-500 font-mono uppercase"
+              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:border-green-500 font-mono uppercase"
               placeholder="e.g., ABC123"
               required
             />
@@ -88,7 +88,7 @@ export default function StudentPage() {
               id="meetingPasscode"
               value={meetingPasscode}
               onChange={(e) => setMeetingPasscode(e.target.value)}
-              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:border-green-500"
+              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-green-500 focus:border-green-500"
               placeholder="Enter the meeting passcode"
               required
             />
@@ -98,7 +98,7 @@ export default function StudentPage() {
           </div>
           
           {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm">
+            <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm break-words">
               {error}
             </div>
           )}
@@ -114,7 +114,7 @@ export default function StudentPage() {
         
         <button
           onClick={() => window.location.href = '/'}
-          className="w-full mt-4 py-2 text-gray-600 hover:text-gray-800"
+          className="w-full mt-4 py-3 sm:py-2 text-gray-600 hover:text-gray-800"
         >
           Back to Home
         </button>
