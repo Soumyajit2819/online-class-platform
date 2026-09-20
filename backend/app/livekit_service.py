@@ -336,27 +336,92 @@ class LiveKitService:
             print(f"Error removing participant: {e}")
 
     async def mute_participant(self, livekit_room_name: str, identity: str, muted: bool = True):
+        """
+        Mute/unmute a participant's microphone.
+        LiveKit requires the actual track SID — we fetch it first then mute.
+        """
         try:
-            from livekit.api.room_service import MuteRoomTrackRequest
+            from livekit.api.room_service import MuteRoomTrackRequest, ListParticipantsRequest
             rs = await self.get_room_service()
-            await rs.mute_room_track(MuteRoomTrackRequest(
-                room=livekit_room_name, identity=identity, track_sid="microphone", muted=muted))
+
+            # Step 1: Get all participants to find the actual audio track SID
+            resp         = await rs.list_participants(ListParticipantsRequest(room=livekit_room_name))
+            participant  = next((p for p in resp.participants if p.identity == identity), None)
+
+            if not participant:
+                print(f"Participant {identity} not found in room")
+                return
+
+            # Step 2: Find their microphone/audio track(s)
+            # TrackSource MICROPHONE = 2, TrackType AUDIO = 0
+            audio_tracks = [
+                t for t in participant.tracks
+                if t.type == 0 and t.source == 2  # AUDIO + MICROPHONE
+            ]
+
+            if not audio_tracks:
+                # Fallback: any audio track
+                audio_tracks = [t for t in participant.tracks if t.type == 0]
+
+            if not audio_tracks:
+                print(f"No audio tracks found for {identity}")
+                return
+
+            # Step 3: Mute each audio track using its real SID
+            for track in audio_tracks:
+                print(f"  {'Muting' if muted else 'Unmuting'} track {track.sid} for {identity}")
+                await rs.mute_room_track(MuteRoomTrackRequest(
+                    room=livekit_room_name,
+                    identity=identity,
+                    track_sid=track.sid,   # ← real SID like TR_xxxx
+                    muted=muted,
+                ))
+
         except Exception as e:
-            print(f"Error muting participant: {e}")
+            print(f"Error muting participant {identity}: {e}")
 
     async def mute_all_students(self, livekit_room_name: str, identities: List[str]):
         for identity in identities:
             await self.mute_participant(livekit_room_name, identity, True)
 
     async def disable_all_cameras(self, livekit_room_name: str, identities: List[str]):
-        for identity in identities:
-            try:
-                from livekit.api.room_service import MuteRoomTrackRequest
-                rs = await self.get_room_service()
-                await rs.mute_room_track(MuteRoomTrackRequest(
-                    room=livekit_room_name, identity=identity, track_sid="camera", muted=True))
-            except Exception as e:
-                print(f"Error disabling camera for {identity}: {e}")
+        """
+        Disable camera tracks for a list of participants.
+        Fetches real video track SIDs first, then mutes them.
+        """
+        try:
+            from livekit.api.room_service import MuteRoomTrackRequest, ListParticipantsRequest
+            rs   = await self.get_room_service()
+            resp = await rs.list_participants(ListParticipantsRequest(room=livekit_room_name))
+
+            for participant in resp.participants:
+                if participant.identity not in identities:
+                    continue
+
+                # TrackSource CAMERA = 1, TrackType VIDEO = 1
+                video_tracks = [
+                    t for t in participant.tracks
+                    if t.type == 1 and t.source == 1  # VIDEO + CAMERA
+                ]
+
+                if not video_tracks:
+                    # Fallback: any video track
+                    video_tracks = [t for t in participant.tracks if t.type == 1]
+
+                for track in video_tracks:
+                    print(f"  Disabling camera track {track.sid} for {participant.identity}")
+                    try:
+                        await rs.mute_room_track(MuteRoomTrackRequest(
+                            room=livekit_room_name,
+                            identity=participant.identity,
+                            track_sid=track.sid,   # ← real SID
+                            muted=True,
+                        ))
+                    except Exception as e:
+                        print(f"  Error disabling camera for {participant.identity}: {e}")
+
+        except Exception as e:
+            print(f"Error disabling cameras: {e}")
 
     # ---- recording -------------------------------------------------------
 
