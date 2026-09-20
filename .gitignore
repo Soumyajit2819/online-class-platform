@@ -1,7 +1,16 @@
-# Backend
+# ============================
+# SECRETS — NEVER COMMIT THESE
+# ============================
 backend/.env
+frontend/.env.local
+frontend/.env*.local
+**/.env.local
+**/.env.production
+
+# Backend
 backend/__pycache__/
 backend/**/*.pyc
+backend/**/*.pyo
 backend/venv/
 backend/.venv/
 backend/.pytest_cache/
@@ -12,14 +21,18 @@ backend/.coverage
 frontend/node_modules/
 frontend/.next/
 frontend/out/
-frontend/.env*.local
+frontend/build/
 
 # OS
 .DS_Store
 Thumbs.db
+*.pem
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Vercel
+.vercel

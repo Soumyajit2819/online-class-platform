@@ -9,7 +9,10 @@ class Settings:
     LIVEKIT_URL: str        = os.getenv("LIVEKIT_URL", "")
     LIVEKIT_API_KEY: str    = os.getenv("LIVEKIT_API_KEY", "")
     LIVEKIT_API_SECRET: str = os.getenv("LIVEKIT_API_SECRET", "")
-    FRONTEND_URL: str       = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+    # Frontend URL (single or comma-separated list for multiple origins)
+    # e.g. "http://localhost:3000,https://your-app.vercel.app"
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
     # Supabase Storage (S3 for recordings)
     SUPABASE_S3_ENDPOINT:   str = os.getenv("SUPABASE_S3_ENDPOINT", "")
@@ -23,8 +26,20 @@ class Settings:
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     SUPABASE_ANON_KEY:         str = os.getenv("SUPABASE_ANON_KEY", "")
 
-    # Admin passcode for the admin dashboard itself
+    # Admin dashboard password (set a strong value in production)
     ADMIN_DASHBOARD_PASSWORD: str = os.getenv("ADMIN_DASHBOARD_PASSWORD", "")
+
+    # Environment flag
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT == "production"
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        """Parse comma-separated FRONTEND_URL into a list."""
+        return [o.strip() for o in self.FRONTEND_URL.split(",") if o.strip()]
 
     def validate(self) -> bool:
         required = [
@@ -58,7 +73,6 @@ class Settings:
         missing = [name for name, value in required if not value]
         if missing:
             print(f"⚠ Missing Supabase DB credentials: {', '.join(missing)}")
-            print("  Admin passcode system will not work without these")
             return False
         return True
 

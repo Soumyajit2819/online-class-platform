@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Any, List
+from contextlib import asynccontextmanager
+from pydantic import BaseModel as PydanticBase
 import secrets
 import asyncio
 
@@ -15,31 +16,31 @@ from .models import (
 from .livekit_service import livekit_service, session_state, recording_state
 from .passcode_service import passcode_service
 
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="Online Class Platform API",
-    description="Backend API for LiveKit-based online classroom",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 # ---------------------------------------------------------------------------
-# Startup
+# Background task
 # ---------------------------------------------------------------------------
 
-@app.on_event("startup")
-async def startup_event():
+async def _cleanup_loop():
+    """Hourly: remove expired recording metadata + delete S3 files."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            expired = recording_state.cleanup_expired()
+            if expired:
+                print(f"✓ Cleaned {len(expired)} expired recording entries")
+            await livekit_service.delete_expired_recordings_from_storage()
+        except Exception as e:
+            print(f"✗ Cleanup error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (startup + shutdown)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     try:
         settings.validate()
         print("✓ LiveKit configuration validated")
@@ -54,24 +55,36 @@ async def startup_event():
         print("✓ Supabase DB credentials found")
         await passcode_service.init_db()
 
-    asyncio.create_task(_cleanup_loop())
+    task = asyncio.create_task(_cleanup_loop())
+    print("✓ Application startup complete")
+
+    yield  # app runs here
+
+    # Shutdown
+    task.cancel()
+    print("✓ Application shutdown complete")
 
 
-async def _cleanup_loop():
-    """Hourly cleanup: removes expired in-memory metadata AND deletes files from Supabase S3."""
-    while True:
-        await asyncio.sleep(3600)  # run every hour
-        try:
-            # 1. Clean expired in-memory metadata
-            expired = recording_state.cleanup_expired()
-            if expired:
-                print(f"✓ Cleaned up {len(expired)} expired recording entries from memory")
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
-            # 2. Delete expired files from Supabase S3
-            await livekit_service.delete_expired_recordings_from_storage()
+app = FastAPI(
+    title="Online Class Platform API",
+    description="Backend API for LiveKit-based online classroom",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs"  if settings.ENVIRONMENT != "production" else None,
+    redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
+)
 
-        except Exception as e:
-            print(f"✗ Error in cleanup task: {e}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +93,15 @@ async def _cleanup_loop():
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "environment": settings.ENVIRONMENT,
+        "services": {
+            "livekit":  bool(settings.LIVEKIT_URL and settings.LIVEKIT_API_KEY),
+            "storage":  bool(settings.SUPABASE_S3_ENDPOINT and settings.SUPABASE_S3_ACCESS_KEY),
+            "database": bool(settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -188,15 +209,15 @@ async def get_class_info(room_code: str):
     if not c:
         raise HTTPException(404, "Class not found")
     return {
-        "room_code":                room_code,
-        "class_name":               c["class_name"],
-        "teacher_name":             c["teacher_name"],
-        "is_locked":                c["is_locked"],
-        "is_ended":                 c["is_ended"],
-        "is_recording":             c["is_recording"],
-        "max_participants":         c["max_participants"],
+        "room_code":                 room_code,
+        "class_name":                c["class_name"],
+        "teacher_name":              c["teacher_name"],
+        "is_locked":                 c["is_locked"],
+        "is_ended":                  c["is_ended"],
+        "is_recording":              c["is_recording"],
+        "max_participants":          c["max_participants"],
         "student_microphone_policy": c["student_microphone_policy"].value,
-        "student_camera_policy":    c["student_camera_policy"].value,
+        "student_camera_policy":     c["student_camera_policy"].value,
     }
 
 
@@ -213,7 +234,7 @@ async def get_participants(room_code: str):
 
 
 # ---------------------------------------------------------------------------
-# Teacher moderation
+# Teacher moderation helper
 # ---------------------------------------------------------------------------
 
 def _verify_teacher(room_code: str, teacher_identity: str):
@@ -224,6 +245,10 @@ def _verify_teacher(room_code: str, teacher_identity: str):
         raise HTTPException(403, "Only the teacher can perform this action")
     return c
 
+
+# ---------------------------------------------------------------------------
+# Teacher moderation endpoints
+# ---------------------------------------------------------------------------
 
 @app.post("/api/teacher/mute-all")
 async def mute_all_students(request: MuteAllRequest):
@@ -296,16 +321,12 @@ async def unlock_class(request: LockClassRequest):
 
 @app.post("/api/teacher/end-class")
 async def end_class(request: EndClassRequest):
-    c = _verify_teacher(request.room_code, request.teacher_identity)
+    c  = _verify_teacher(request.room_code, request.teacher_identity)
     rc = request.room_code.upper()
-
-    # Auto-stop active recording before ending class
     if session_state.is_recording(rc):
         active_rec_id = c.get("active_recording_id")
         if active_rec_id:
-            print(f"Auto-stopping recording {active_rec_id} before ending class...")
             await livekit_service.stop_recording(rc, active_rec_id)
-
     session_state.end_class(rc)
     await livekit_service.delete_room(c["livekit_room_name"])
     return {"success": True, "message": "Class ended"}
@@ -327,20 +348,14 @@ async def unblock_participant(request: ModerationRequest):
 async def start_recording(request: StartRecordingRequest):
     c  = _verify_teacher(request.room_code, request.teacher_identity)
     rc = request.room_code.upper()
-
     if session_state.is_recording(rc):
         raise HTTPException(400, "Class is already being recorded")
-
     result = await livekit_service.start_recording(
-        room_code=rc,
-        livekit_room_name=c["livekit_room_name"],
-        class_name=c["class_name"],
-        teacher_name=c["teacher_name"],
+        room_code=rc, livekit_room_name=c["livekit_room_name"],
+        class_name=c["class_name"], teacher_name=c["teacher_name"],
     )
-
     if not result["success"]:
         raise HTTPException(500, result.get("error", "Failed to start recording"))
-
     return result
 
 
@@ -348,33 +363,24 @@ async def start_recording(request: StartRecordingRequest):
 async def stop_recording(request: StopRecordingRequest):
     c  = _verify_teacher(request.room_code, request.teacher_identity)
     rc = request.room_code.upper()
-
     result = await livekit_service.stop_recording(rc, request.recording_id)
-
     if not result["success"]:
         raise HTTPException(500, result.get("error", "Failed to stop recording"))
-
     return result
 
 
 # ---------------------------------------------------------------------------
-# Recordings — student dashboard (reads directly from Supabase S3)
+# Recordings — student dashboard (reads from Supabase S3)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/recordings")
 async def get_all_recordings():
-    """
-    Returns all recordings stored in Supabase S3 bucket.
-    Works even after server restart — Supabase is the source of truth.
-    Recordings older than 3 days are automatically excluded.
-    """
     recordings = await livekit_service.list_recordings_from_storage()
     return {"recordings": recordings, "total": len(recordings)}
 
 
 @app.get("/api/recordings/{room_code}")
 async def get_recordings_by_room(room_code: str):
-    """Get recordings for a specific room code."""
     all_recs = await livekit_service.list_recordings_from_storage()
     filtered = [r for r in all_recs if r["room_code"] == room_code.upper()]
     return {"recordings": filtered, "total": len(filtered), "room_code": room_code.upper()}
@@ -382,15 +388,12 @@ async def get_recordings_by_room(room_code: str):
 
 @app.get("/api/recording/{recording_id}/download")
 async def get_download_url(recording_id: str):
-    """Get a fresh pre-signed download URL for a recording."""
     all_recs = await livekit_service.list_recordings_from_storage()
     rec = next((r for r in all_recs if r["recording_id"] == recording_id), None)
-
     if not rec:
         raise HTTPException(404, "Recording not found or has expired")
     if not rec.get("download_url"):
         raise HTTPException(400, "Download URL could not be generated")
-
     return {
         "recording_id": recording_id,
         "download_url": rec["download_url"],
@@ -401,10 +404,8 @@ async def get_download_url(recording_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Passcode verification endpoints
+# Passcode models
 # ---------------------------------------------------------------------------
-
-from pydantic import BaseModel as PydanticBase
 
 class PasscodeRequest(PydanticBase):
     passcode: str
@@ -417,85 +418,61 @@ class UpdatePasscodeRequest(PydanticBase):
     new_passcode: str
 
 
+# ---------------------------------------------------------------------------
+# Passcode endpoints
+# ---------------------------------------------------------------------------
+
 @app.post("/api/auth/verify-teacher-passcode")
 async def verify_teacher_passcode(request: PasscodeRequest):
-    """
-    Verify teacher access passcode.
-    Frontend calls this before showing the teacher/create-class page.
-    """
     if not request.passcode or not request.passcode.strip():
         raise HTTPException(400, "Passcode is required")
-
     if passcode_service.verify_teacher_passcode(request.passcode):
         return {"success": True, "message": "Access granted"}
-    else:
-        raise HTTPException(403, "Invalid passcode")
+    raise HTTPException(403, "Invalid passcode")
 
 
 @app.post("/api/auth/verify-recordings-passcode")
 async def verify_recordings_passcode(request: PasscodeRequest):
-    """
-    Verify recordings access passcode.
-    Frontend calls this before showing the recordings page.
-    """
     if not request.passcode or not request.passcode.strip():
         raise HTTPException(400, "Passcode is required")
-
     if passcode_service.verify_recordings_passcode(request.passcode):
         return {"success": True, "message": "Access granted"}
-    else:
-        raise HTTPException(403, "Invalid passcode")
+    raise HTTPException(403, "Invalid passcode")
 
 
 @app.post("/api/admin/login")
 async def admin_login(request: AdminLoginRequest):
-    """Verify admin dashboard password."""
     if not request.password or not request.password.strip():
         raise HTTPException(400, "Password is required")
-
     if not settings.ADMIN_DASHBOARD_PASSWORD:
-        raise HTTPException(503, "Admin dashboard is not configured. Set ADMIN_DASHBOARD_PASSWORD in .env")
-
+        raise HTTPException(503, "Admin not configured. Set ADMIN_DASHBOARD_PASSWORD in .env")
     if passcode_service.verify_admin_password(request.password):
         return {"success": True, "message": "Admin access granted"}
-    else:
-        raise HTTPException(403, "Invalid admin password")
+    raise HTTPException(403, "Invalid admin password")
 
 
 @app.post("/api/admin/update-teacher-passcode")
 async def update_teacher_passcode(request: UpdatePasscodeRequest):
-    """Update teacher access passcode (admin only)."""
     if not passcode_service.verify_admin_password(request.admin_password):
         raise HTTPException(403, "Invalid admin password")
-
     if not request.new_passcode or len(request.new_passcode.strip()) < 6:
-        raise HTTPException(400, "New passcode must be at least 6 characters")
-
+        raise HTTPException(400, "Passcode must be at least 6 characters")
     if passcode_service.update_teacher_passcode(request.new_passcode):
         return {"success": True, "message": "Teacher passcode updated"}
-    else:
-        raise HTTPException(500, "Failed to update passcode")
+    raise HTTPException(500, "Failed to update passcode")
 
 
 @app.post("/api/admin/update-recordings-passcode")
 async def update_recordings_passcode(request: UpdatePasscodeRequest):
-    """Update recordings access passcode (admin only)."""
     if not passcode_service.verify_admin_password(request.admin_password):
         raise HTTPException(403, "Invalid admin password")
-
     if not request.new_passcode or len(request.new_passcode.strip()) < 6:
-        raise HTTPException(400, "New passcode must be at least 6 characters")
-
+        raise HTTPException(400, "Passcode must be at least 6 characters")
     if passcode_service.update_recordings_passcode(request.new_passcode):
         return {"success": True, "message": "Recordings passcode updated"}
-    else:
-        raise HTTPException(500, "Failed to update passcode")
+    raise HTTPException(500, "Failed to update passcode")
 
 
 @app.get("/api/admin/passcode-status")
 async def get_passcode_status():
-    """
-    Returns whether passcodes are configured.
-    Does NOT return the passcode or hash — safe to call publicly.
-    """
     return passcode_service.get_passcode_info()
