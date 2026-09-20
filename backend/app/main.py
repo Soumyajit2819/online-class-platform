@@ -1,35 +1,29 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, List
+from typing import Any, List
 import secrets
 import asyncio
-from datetime import datetime
 
 from .config import settings
 from .models import (
-    CreateRoomRequest,
-    JoinRoomRequest,
-    RoomResponse,
-    ModerationRequest,
-    MuteAllRequest,
-    SetPolicyRequest,
-    LockClassRequest,
-    EndClassRequest,
-    StartRecordingRequest,
-    StopRecordingRequest,
-    MicrophonePolicy,
-    CameraPolicy,
+    CreateRoomRequest, JoinRoomRequest, RoomResponse,
+    ModerationRequest, MuteAllRequest, SetPolicyRequest,
+    LockClassRequest, EndClassRequest,
+    StartRecordingRequest, StopRecordingRequest,
+    MicrophonePolicy, CameraPolicy,
 )
 from .livekit_service import livekit_service, session_state, recording_state
 
-# Create FastAPI app
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title="Online Class Platform API",
     description="Backend API for LiveKit-based online classroom",
     version="1.0.0",
 )
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL],
@@ -39,66 +33,68 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
 @app.on_event("startup")
 async def startup_event():
-    """Validate environment variables on startup."""
     try:
         settings.validate()
-        print("✓ LiveKit configuration validated successfully")
+        print("✓ LiveKit configuration validated")
     except ValueError as e:
-        print(f"⚠ Configuration warning: {e}")
-        print("  Some features may not work correctly without proper LiveKit credentials")
-    
-    # Validate Supabase Storage for recordings
+        print(f"⚠ LiveKit config warning: {e}")
+
     if settings.validate_storage():
         print("✓ Supabase Storage credentials found")
-        # Auto-create bucket if it doesn't exist
         await livekit_service.ensure_bucket_exists()
-    
-    # Start background cleanup task for expired recordings
-    asyncio.create_task(cleanup_expired_recordings_task())
+
+    asyncio.create_task(_cleanup_loop())
 
 
-# Health check endpoint
+async def _cleanup_loop():
+    """Hourly cleanup of expired in-memory recording metadata."""
+    while True:
+        await asyncio.sleep(3600)
+        expired = recording_state.cleanup_expired()
+        if expired:
+            print(f"✓ Cleaned up {len(expired)} expired recording entries")
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
 
 
-# Teacher creates a new class
+# ---------------------------------------------------------------------------
+# Teacher — create room
+# ---------------------------------------------------------------------------
+
 @app.post("/api/teacher/create-room", response_model=RoomResponse)
 async def create_room(request: CreateRoomRequest):
-    """Create a new class room for teacher."""
-    # Validate inputs
-    if not request.teacher_name or not request.teacher_name.strip():
-        raise HTTPException(status_code=400, detail="Teacher name is required")
-    if not request.room_name or not request.room_name.strip():
-        raise HTTPException(status_code=400, detail="Class name is required")
-    if not request.meeting_passcode or not request.meeting_passcode.strip():
-        raise HTTPException(status_code=400, detail="Meeting passcode is required")
-    if request.max_participants < 2 or request.max_participants > 50:
-        raise HTTPException(status_code=400, detail="Max participants must be between 2 and 50")
-    
-    # Generate room code and LiveKit room name
-    room_code = livekit_service.generate_room_code()
-    livekit_room_name = livekit_service.generate_livekit_room_name()
-    
-    # Generate teacher identity
+    if not request.teacher_name.strip():
+        raise HTTPException(400, "Teacher name is required")
+    if not request.room_name.strip():
+        raise HTTPException(400, "Class name is required")
+    if not request.meeting_passcode.strip():
+        raise HTTPException(400, "Meeting passcode is required")
+    if not (2 <= request.max_participants <= 50):
+        raise HTTPException(400, "Max participants must be between 2 and 50")
+
+    room_code        = livekit_service.generate_room_code()
+    livekit_room     = livekit_service.generate_livekit_room_name()
     teacher_identity = f"teacher_{secrets.token_urlsafe(8)}"
-    
-    # Hash the meeting passcode
-    passcode_hash = livekit_service.hash_passcode(request.meeting_passcode)
-    
-    # Create LiveKit room
-    await livekit_service.create_room(
-        livekit_room_name,
-        max_participants=request.max_participants,
-    )
-    
-    # Store session state
+    passcode_hash    = livekit_service.hash_passcode(request.meeting_passcode)
+
+    await livekit_service.create_room(livekit_room, max_participants=request.max_participants)
+
     session_state.create_class(
         room_code=room_code,
-        livekit_room_name=livekit_room_name,
+        livekit_room_name=livekit_room,
         class_name=request.room_name,
         teacher_name=request.teacher_name,
         teacher_identity=teacher_identity,
@@ -107,506 +103,285 @@ async def create_room(request: CreateRoomRequest):
         student_microphone_policy=request.student_microphone_policy,
         student_camera_policy=request.student_camera_policy,
     )
-    
-    # Determine if teacher should start muted/camera off based on policies
-    is_muted = request.student_microphone_policy == MicrophonePolicy.MUTED_BY_DEFAULT
-    is_camera_off = request.student_camera_policy == CameraPolicy.OFF_BY_DEFAULT
-    
-    # Generate teacher token
+
     token = livekit_service.create_access_token(
-        identity=teacher_identity,
-        name=request.teacher_name,
-        room=livekit_room_name,
-        role="teacher",
-        can_publish=True,
-        can_subscribe=True,
-        can_publish_data=True,
-    )
-    
-    return RoomResponse(
-        room_code=room_code,
-        room_name=request.room_name,
-        token=token,
-        livekit_url=settings.LIVEKIT_URL,
+        identity=teacher_identity, name=request.teacher_name,
+        room=livekit_room, role="teacher",
+        can_publish=True, can_subscribe=True, can_publish_data=True,
     )
 
+    return RoomResponse(room_code=room_code, room_name=request.room_name,
+                        token=token, livekit_url=settings.LIVEKIT_URL)
 
-# Student joins a class
+
+# ---------------------------------------------------------------------------
+# Student — join room
+# ---------------------------------------------------------------------------
+
 @app.post("/api/student/join-room", response_model=RoomResponse)
 async def join_room(request: JoinRoomRequest):
-    """Student joins an existing class room."""
-    # Validate inputs
-    if not request.student_name or not request.student_name.strip():
-        raise HTTPException(status_code=400, detail="Student name is required")
-    if not request.room_code or not request.room_code.strip():
-        raise HTTPException(status_code=400, detail="Room code is required")
-    if not request.meeting_passcode or not request.meeting_passcode.strip():
-        raise HTTPException(status_code=400, detail="Meeting passcode is required")
-    
-    # Check if class exists and is active
-    if not session_state.is_class_active(request.room_code):
-        raise HTTPException(status_code=404, detail="Class not found or has ended")
-    
-    # Check if class is locked
-    if session_state.is_class_locked(request.room_code):
-        raise HTTPException(status_code=403, detail="Class is locked. New students cannot join.")
-    
-    # Verify meeting passcode
-    if not session_state.verify_passcode(request.room_code, request.meeting_passcode):
-        raise HTTPException(status_code=403, detail="Invalid meeting passcode")
-    
-    # Get class info
-    class_info = session_state.get_class(request.room_code)
+    if not request.student_name.strip():
+        raise HTTPException(400, "Student name is required")
+    if not request.room_code.strip():
+        raise HTTPException(400, "Room code is required")
+    if not request.meeting_passcode.strip():
+        raise HTTPException(400, "Meeting passcode is required")
+
+    rc = request.room_code.upper()
+
+    if not session_state.is_class_active(rc):
+        raise HTTPException(404, "Class not found or has ended")
+    if session_state.is_class_locked(rc):
+        raise HTTPException(403, "Class is locked. New students cannot join.")
+    if not session_state.verify_passcode(rc, request.meeting_passcode):
+        raise HTTPException(403, "Invalid meeting passcode")
+
+    class_info = session_state.get_class(rc)
     if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Generate student identity
+        raise HTTPException(404, "Class not found")
+
     student_identity = f"student_{secrets.token_urlsafe(8)}"
-    
-    # Check if student is blocked
-    if session_state.is_participant_blocked(request.room_code, student_identity):
-        raise HTTPException(status_code=403, detail="You have been removed from this class")
-    
-    # Get current participant count from LiveKit
+
+    if session_state.is_participant_blocked(rc, student_identity):
+        raise HTTPException(403, "You have been removed from this class")
+
     participants = await livekit_service.get_participants(class_info["livekit_room_name"])
-    current_count = len(participants)
-    
-    if current_count >= class_info["max_participants"]:
-        raise HTTPException(status_code=403, detail="Class is full. Maximum participants reached.")
-    
-    # Get policies
-    mic_policy = session_state.get_microphone_policy(request.room_code)
-    camera_policy = session_state.get_camera_policy(request.room_code)
-    
-    # Determine publishing permissions based on policies
-    can_publish_audio = mic_policy != MicrophonePolicy.LOCKED
-    can_publish_video = camera_policy != CameraPolicy.LOCKED
-    
-    # Determine initial states
-    is_muted = mic_policy == MicrophonePolicy.MUTED_BY_DEFAULT or mic_policy == MicrophonePolicy.LOCKED
-    is_camera_off = camera_policy == CameraPolicy.OFF_BY_DEFAULT or camera_policy == CameraPolicy.LOCKED
-    
-    # Generate student token
+    if len(participants) >= class_info["max_participants"]:
+        raise HTTPException(403, "Class is full. Maximum 50 participants reached.")
+
+    mic_policy    = session_state.get_microphone_policy(rc)
+    camera_policy = session_state.get_camera_policy(rc)
+
     token = livekit_service.create_access_token(
-        identity=student_identity,
-        name=request.student_name,
-        room=class_info["livekit_room_name"],
-        role="student",
-        can_publish=can_publish_audio and can_publish_video,
-        can_subscribe=True,
-        can_publish_data=True,
-        is_muted=is_muted,
-        is_camera_off=is_camera_off,
-    )
-    
-    return RoomResponse(
-        room_code=request.room_code,
-        room_name=class_info["class_name"],
-        token=token,
-        livekit_url=settings.LIVEKIT_URL,
+        identity=student_identity, name=request.student_name,
+        room=class_info["livekit_room_name"], role="student",
+        can_publish=(mic_policy != MicrophonePolicy.LOCKED and camera_policy != CameraPolicy.LOCKED),
+        can_subscribe=True, can_publish_data=True,
+        is_muted=(mic_policy in (MicrophonePolicy.MUTED_BY_DEFAULT, MicrophonePolicy.LOCKED)),
+        is_camera_off=(camera_policy in (CameraPolicy.OFF_BY_DEFAULT, CameraPolicy.LOCKED)),
     )
 
+    return RoomResponse(room_code=rc, room_name=class_info["class_name"],
+                        token=token, livekit_url=settings.LIVEKIT_URL)
 
-# Get class info
+
+# ---------------------------------------------------------------------------
+# Class info
+# ---------------------------------------------------------------------------
+
 @app.get("/api/class/{room_code}")
 async def get_class_info(room_code: str):
-    """Get information about a class."""
-    class_info = session_state.get_class(room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
+    c = session_state.get_class(room_code.upper())
+    if not c:
+        raise HTTPException(404, "Class not found")
     return {
-        "room_code": room_code,
-        "class_name": class_info["class_name"],
-        "teacher_name": class_info["teacher_name"],
-        "is_locked": class_info["is_locked"],
-        "is_ended": class_info["is_ended"],
-        "max_participants": class_info["max_participants"],
-        "student_microphone_policy": class_info["student_microphone_policy"].value,
-        "student_camera_policy": class_info["student_camera_policy"].value,
+        "room_code":                room_code,
+        "class_name":               c["class_name"],
+        "teacher_name":             c["teacher_name"],
+        "is_locked":                c["is_locked"],
+        "is_ended":                 c["is_ended"],
+        "is_recording":             c["is_recording"],
+        "max_participants":         c["max_participants"],
+        "student_microphone_policy": c["student_microphone_policy"].value,
+        "student_camera_policy":    c["student_camera_policy"].value,
     }
 
 
-# Get participants in a class
 @app.get("/api/class/{room_code}/participants")
 async def get_participants(room_code: str):
-    """Get list of participants in a class."""
-    class_info = session_state.get_class(room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    participants = await livekit_service.get_participants(class_info["livekit_room_name"])
-    
-    # Enhance with role information
+    c = session_state.get_class(room_code.upper())
+    if not c:
+        raise HTTPException(404, "Class not found")
+    participants = await livekit_service.get_participants(c["livekit_room_name"])
     for p in participants:
-        if p["identity"] == class_info["teacher_identity"]:
-            p["role"] = "teacher"
-        else:
-            p["role"] = "student"
-    
-    return {
-        "room_code": room_code,
-        "participants": participants,
-        "count": len(participants),
-        "max_participants": class_info["max_participants"],
-    }
+        p["role"] = "teacher" if p["identity"] == c["teacher_identity"] else "student"
+    return {"room_code": room_code, "participants": participants,
+            "count": len(participants), "max_participants": c["max_participants"]}
 
 
-# Teacher moderation: Mute all students
+# ---------------------------------------------------------------------------
+# Teacher moderation
+# ---------------------------------------------------------------------------
+
+def _verify_teacher(room_code: str, teacher_identity: str):
+    c = session_state.get_class(room_code.upper())
+    if not c:
+        raise HTTPException(404, "Class not found")
+    if not session_state.is_teacher(room_code.upper(), teacher_identity):
+        raise HTTPException(403, "Only the teacher can perform this action")
+    return c
+
+
 @app.post("/api/teacher/mute-all")
 async def mute_all_students(request: MuteAllRequest):
-    """Mute all student microphones."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
-    # Get all participants
-    participants = await livekit_service.get_participants(class_info["livekit_room_name"])
-    
-    # Filter students
-    student_identities = [
-        p["identity"] for p in participants
-        if p["identity"] != class_info["teacher_identity"]
-    ]
-    
-    # Mute all students
-    await livekit_service.mute_all_students(class_info["livekit_room_name"], student_identities)
-    
+    c = _verify_teacher(request.room_code, request.teacher_identity)
+    participants = await livekit_service.get_participants(c["livekit_room_name"])
+    students = [p["identity"] for p in participants if p["identity"] != c["teacher_identity"]]
+    await livekit_service.mute_all_students(c["livekit_room_name"], students)
     return {"success": True, "message": "All students muted"}
 
 
-# Teacher moderation: Disable all student cameras
 @app.post("/api/teacher/disable-all-cameras")
 async def disable_all_cameras(request: MuteAllRequest):
-    """Disable all student cameras."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
-    # Get all participants
-    participants = await livekit_service.get_participants(class_info["livekit_room_name"])
-    
-    # Filter students
-    student_identities = [
-        p["identity"] for p in participants
-        if p["identity"] != class_info["teacher_identity"]
-    ]
-    
-    # Disable all student cameras
-    await livekit_service.disable_all_cameras(class_info["livekit_room_name"], student_identities)
-    
+    c = _verify_teacher(request.room_code, request.teacher_identity)
+    participants = await livekit_service.get_participants(c["livekit_room_name"])
+    students = [p["identity"] for p in participants if p["identity"] != c["teacher_identity"]]
+    await livekit_service.disable_all_cameras(c["livekit_room_name"], students)
     return {"success": True, "message": "All student cameras disabled"}
 
 
-# Teacher moderation: Remove participant
 @app.post("/api/teacher/remove-participant")
 async def remove_participant(request: ModerationRequest):
-    """Remove a participant from the class."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    c = _verify_teacher(request.room_code, request.teacher_identity)
     if not request.target_identity:
-        raise HTTPException(status_code=400, detail="Target participant identity is required")
-    
-    # Cannot remove the teacher
-    if request.target_identity == class_info["teacher_identity"]:
-        raise HTTPException(status_code=400, detail="Cannot remove the teacher")
-    
-    # Remove participant from LiveKit room
-    await livekit_service.remove_participant(class_info["livekit_room_name"], request.target_identity)
-    
-    # Block the participant from rejoining
+        raise HTTPException(400, "Target identity required")
+    if request.target_identity == c["teacher_identity"]:
+        raise HTTPException(400, "Cannot remove the teacher")
+    await livekit_service.remove_participant(c["livekit_room_name"], request.target_identity)
     session_state.block_participant(request.room_code.upper(), request.target_identity)
-    
-    return {"success": True, "message": f"Participant {request.target_identity} removed"}
+    return {"success": True, "message": "Participant removed"}
 
 
-# Teacher moderation: Mute individual participant
 @app.post("/api/teacher/mute-participant")
 async def mute_participant(request: ModerationRequest):
-    """Mute a specific participant."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    c = _verify_teacher(request.room_code, request.teacher_identity)
     if not request.target_identity:
-        raise HTTPException(status_code=400, detail="Target participant identity is required")
-    
-    # Mute participant
-    await livekit_service.mute_participant(class_info["livekit_room_name"], request.target_identity, True)
-    
-    return {"success": True, "message": f"Participant {request.target_identity} muted"}
+        raise HTTPException(400, "Target identity required")
+    await livekit_service.mute_participant(c["livekit_room_name"], request.target_identity, True)
+    return {"success": True, "message": "Participant muted"}
 
 
-# Teacher moderation: Set microphone policy
 @app.post("/api/teacher/set-microphone-policy")
 async def set_microphone_policy(request: SetPolicyRequest):
-    """Set student microphone policy."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    _verify_teacher(request.room_code, request.teacher_identity)
     if request.microphone_policy:
         session_state.update_microphone_policy(request.room_code.upper(), request.microphone_policy)
-    
-    return {
-        "success": True,
-        "message": f"Microphone policy updated to {request.microphone_policy.value if request.microphone_policy else 'no change'}"
-    }
+    return {"success": True}
 
 
-# Teacher moderation: Set camera policy
 @app.post("/api/teacher/set-camera-policy")
 async def set_camera_policy(request: SetPolicyRequest):
-    """Set student camera policy."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    _verify_teacher(request.room_code, request.teacher_identity)
     if request.camera_policy:
         session_state.update_camera_policy(request.room_code.upper(), request.camera_policy)
-    
-    return {
-        "success": True,
-        "message": f"Camera policy updated to {request.camera_policy.value if request.camera_policy else 'no change'}"
-    }
+    return {"success": True}
 
 
-# Teacher moderation: Lock class
 @app.post("/api/teacher/lock-class")
 async def lock_class(request: LockClassRequest):
-    """Lock the class to prevent new students from joining."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    _verify_teacher(request.room_code, request.teacher_identity)
     session_state.lock_class(request.room_code.upper())
-    
     return {"success": True, "message": "Class locked"}
 
 
-# Teacher moderation: Unlock class
 @app.post("/api/teacher/unlock-class")
 async def unlock_class(request: LockClassRequest):
-    """Unlock the class to allow new students to join."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    _verify_teacher(request.room_code, request.teacher_identity)
     session_state.unlock_class(request.room_code.upper())
-    
     return {"success": True, "message": "Class unlocked"}
 
 
-# Teacher moderation: End class
 @app.post("/api/teacher/end-class")
 async def end_class(request: EndClassRequest):
-    """End the class for everyone."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can end the class")
-    
-    # Mark class as ended
-    session_state.end_class(request.room_code.upper())
-    
-    # Delete the LiveKit room (disconnects all participants)
-    await livekit_service.delete_room(class_info["livekit_room_name"])
-    
+    c = _verify_teacher(request.room_code, request.teacher_identity)
+    rc = request.room_code.upper()
+
+    # Auto-stop active recording before ending class
+    if session_state.is_recording(rc):
+        active_rec_id = c.get("active_recording_id")
+        if active_rec_id:
+            print(f"Auto-stopping recording {active_rec_id} before ending class...")
+            await livekit_service.stop_recording(rc, active_rec_id)
+
+    session_state.end_class(rc)
+    await livekit_service.delete_room(c["livekit_room_name"])
     return {"success": True, "message": "Class ended"}
 
 
-# Unblock participant (optional feature for teacher)
 @app.post("/api/teacher/unblock-participant")
 async def unblock_participant(request: ModerationRequest):
-    """Allow a removed participant to rejoin."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can perform this action")
-    
+    _verify_teacher(request.room_code, request.teacher_identity)
     if request.target_identity:
         session_state.unblock_participant(request.room_code.upper(), request.target_identity)
-    
-    return {"success": True, "message": f"Participant {request.target_identity} unblocked"}
+    return {"success": True}
 
 
-
-# Recording endpoints
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
 
 @app.post("/api/teacher/start-recording")
 async def start_recording(request: StartRecordingRequest):
-    """Start recording the class."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can start recording")
-    
-    # Check if already recording
-    if session_state.is_recording(request.room_code.upper()):
-        raise HTTPException(status_code=400, detail="Class is already being recorded")
-    
+    c  = _verify_teacher(request.room_code, request.teacher_identity)
+    rc = request.room_code.upper()
+
+    if session_state.is_recording(rc):
+        raise HTTPException(400, "Class is already being recorded")
+
     result = await livekit_service.start_recording(
-        room_code=request.room_code.upper(),
-        livekit_room_name=class_info["livekit_room_name"],
-        class_name=class_info["class_name"],
-        teacher_name=class_info["teacher_name"],
+        room_code=rc,
+        livekit_room_name=c["livekit_room_name"],
+        class_name=c["class_name"],
+        teacher_name=c["teacher_name"],
     )
-    
+
     if not result["success"]:
-        raise HTTPException(status_code=500, detail=result.get("error", "Failed to start recording"))
-    
+        raise HTTPException(500, result.get("error", "Failed to start recording"))
+
     return result
 
 
 @app.post("/api/teacher/stop-recording")
 async def stop_recording(request: StopRecordingRequest):
-    """Stop recording the class."""
-    class_info = session_state.get_class(request.room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Verify this is the teacher
-    if not session_state.is_teacher(request.room_code.upper(), request.teacher_identity):
-        raise HTTPException(status_code=403, detail="Only the teacher can stop recording")
-    
-    result = await livekit_service.stop_recording(
-        room_code=request.room_code.upper(),
-        recording_id=request.recording_id,
-    )
-    
+    c  = _verify_teacher(request.room_code, request.teacher_identity)
+    rc = request.room_code.upper()
+
+    result = await livekit_service.stop_recording(rc, request.recording_id)
+
     if not result["success"]:
-        raise HTTPException(status_code=500, detail=result.get("error", "Failed to stop recording"))
-    
+        raise HTTPException(500, result.get("error", "Failed to stop recording"))
+
     return result
 
 
-@app.get("/api/class/{room_code}/recordings")
-async def get_class_recordings(room_code: str):
-    """Get all recordings for a class."""
-    class_info = session_state.get_class(room_code.upper())
-    if not class_info:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    recordings = livekit_service.get_class_recordings(room_code.upper())
-    
-    return {
-        "room_code": room_code,
-        "class_name": class_info["class_name"],
-        "recordings": recordings,
-    }
-
+# ---------------------------------------------------------------------------
+# Recordings — student dashboard (reads directly from Supabase S3)
+# ---------------------------------------------------------------------------
 
 @app.get("/api/recordings")
 async def get_all_recordings():
-    """Get all available recordings."""
-    recordings = livekit_service.get_all_available_recordings()
-    return {
-        "recordings": recordings,
-        "total": len(recordings),
-    }
+    """
+    Returns all recordings stored in Supabase S3 bucket.
+    Works even after server restart — Supabase is the source of truth.
+    Recordings older than 3 days are automatically excluded.
+    """
+    recordings = await livekit_service.list_recordings_from_storage()
+    return {"recordings": recordings, "total": len(recordings)}
 
 
-@app.get("/api/recording/{recording_id}")
-async def get_recording_status(recording_id: str):
-    """Get the status of a specific recording."""
-    result = await livekit_service.get_recording_status(recording_id)
-    
-    if not result["success"]:
-        raise HTTPException(status_code=404, detail=result.get("error", "Recording not found"))
-    
-    return result
+@app.get("/api/recordings/{room_code}")
+async def get_recordings_by_room(room_code: str):
+    """Get recordings for a specific room code."""
+    all_recs = await livekit_service.list_recordings_from_storage()
+    filtered = [r for r in all_recs if r["room_code"] == room_code.upper()]
+    return {"recordings": filtered, "total": len(filtered), "room_code": room_code.upper()}
 
 
 @app.get("/api/recording/{recording_id}/download")
-async def get_recording_download_url(recording_id: str):
-    """Get download URL for a recording."""
-    result = await livekit_service.get_recording_status(recording_id)
-    
-    if not result["success"]:
-        raise HTTPException(status_code=404, detail=result.get("error", "Recording not found"))
-    
-    recording = result["recording"]
-    
-    if recording["status"] != "available":
-        raise HTTPException(status_code=400, detail="Recording is not yet available for download")
-    
-    if not recording["download_url"]:
-        raise HTTPException(status_code=404, detail="Download URL not available")
-    
+async def get_download_url(recording_id: str):
+    """Get a fresh pre-signed download URL for a recording."""
+    all_recs = await livekit_service.list_recordings_from_storage()
+    rec = next((r for r in all_recs if r["recording_id"] == recording_id), None)
+
+    if not rec:
+        raise HTTPException(404, "Recording not found or has expired")
+    if not rec.get("download_url"):
+        raise HTTPException(400, "Download URL could not be generated")
+
     return {
         "recording_id": recording_id,
-        "download_url": recording["download_url"],
-        "expires_at": recording["expires_at"].isoformat() if recording.get("expires_at") else None,
-    }
-
-
-
-# Background task for cleaning up expired recordings
-async def cleanup_expired_recordings_task():
-    """Background task that runs every hour to clean up expired recordings."""
-    while True:
-        try:
-            # Sleep for 1 hour
-            await asyncio.sleep(3600)
-            
-            # Cleanup expired recordings
-            expired_ids = recording_state.cleanup_expired_recordings()
-            if expired_ids:
-                print(f"✓ Cleaned up {len(expired_ids)} expired recordings: {', '.join(expired_ids)}")
-        except Exception as e:
-            print(f"✗ Error in cleanup task: {e}")
-
-
-# Manual cleanup endpoint (for testing/admin)
-@app.post("/api/admin/cleanup-recordings")
-async def cleanup_recordings():
-    """Manually trigger cleanup of expired recordings."""
-    expired_ids = recording_state.cleanup_expired_recordings()
-    return {
-        "success": True,
-        "cleaned_count": len(expired_ids),
-        "cleaned_ids": expired_ids,
+        "download_url": rec["download_url"],
+        "expires_at":   rec["expires_at"],
+        "hours_left":   rec["hours_left"],
+        "file_size_mb": rec["file_size_mb"],
     }

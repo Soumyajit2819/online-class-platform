@@ -1,7 +1,8 @@
 import secrets
 import hashlib
+import asyncio
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import aiohttp
 from livekit.api import AccessToken, VideoGrants, S3Upload
 from livekit.api.room_service import RoomService, CreateRoomRequest
@@ -10,626 +11,510 @@ from livekit.api import EncodedFileOutput, EncodedFileType
 from .config import settings
 from .models import MicrophonePolicy, CameraPolicy
 
+
+# ---------------------------------------------------------------------------
+# Recording State
+# ---------------------------------------------------------------------------
+
 class RecordingState:
-    """In-memory state for class recordings."""
-    
+    """In-memory metadata for active recordings (augments persistent S3 storage)."""
+
     def __init__(self):
-        self.recordings: Dict[str, Dict[str, Any]] = {}  # recording_id -> recording_info
-        self.class_recordings: Dict[str, List[str]] = {}  # room_code -> [recording_ids]
-    
-    def add_recording(
-        self,
-        room_code: str,
-        recording_id: str,
-        egress_id: str,
-        livekit_room_name: str,
-        class_name: str,
-        teacher_name: str,
-    ):
-        """Add a new recording."""
-        now = datetime.utcnow()
+        self.recordings: Dict[str, Dict[str, Any]] = {}       # recording_id -> info
+        self.class_recordings: Dict[str, List[str]] = {}      # room_code -> [recording_ids]
+
+    def add_recording(self, room_code: str, recording_id: str, egress_id: str,
+                      livekit_room_name: str, class_name: str, teacher_name: str):
+        now    = datetime.utcnow()
         expiry = now + timedelta(days=3)
-        
         self.recordings[recording_id] = {
-            "recording_id": recording_id,
-            "egress_id": egress_id,
-            "room_code": room_code,
+            "recording_id":      recording_id,
+            "egress_id":         egress_id,
+            "room_code":         room_code,
             "livekit_room_name": livekit_room_name,
-            "class_name": class_name,
-            "teacher_name": teacher_name,
-            "status": "starting",  # starting, recording, paused, ended, processing, available, failed
-            "started_at": now,
-            "ended_at": None,
-            "expires_at": expiry,
-            "duration_seconds": 0,
-            "download_url": None,
-            "file_size": 0,
+            "class_name":        class_name,
+            "teacher_name":      teacher_name,
+            "status":            "recording",
+            "started_at":        now,
+            "ended_at":          None,
+            "expires_at":        expiry,
         }
-        
-        if room_code not in self.class_recordings:
-            self.class_recordings[room_code] = []
-        self.class_recordings[room_code].append(recording_id)
-    
+        self.class_recordings.setdefault(room_code, []).append(recording_id)
+
     def get_recording(self, recording_id: str) -> Optional[Dict[str, Any]]:
         return self.recordings.get(recording_id)
-    
-    def update_recording_status(self, recording_id: str, status: str, **kwargs):
-        """Update recording status and other fields."""
-        if recording_id in self.recordings:
-            self.recordings[recording_id]["status"] = status
-            for key, value in kwargs.items():
-                if key in self.recordings[recording_id]:
-                    self.recordings[recording_id][key] = value
-    
-    def get_class_recordings(self, room_code: str) -> List[Dict[str, Any]]:
-        """Get all recordings for a class."""
-        recording_ids = self.class_recordings.get(room_code, [])
-        return [self.recordings[rid] for rid in recording_ids if rid in self.recordings]
-    
-    def get_available_recordings(self) -> List[Dict[str, Any]]:
-        """Get all available recordings that haven't expired."""
-        now = datetime.utcnow()
-        available = []
-        for recording in self.recordings.values():
-            if recording["status"] == "available" and recording["expires_at"] > now:
-                available.append(recording)
-        return available
-    
-    def cleanup_expired_recordings(self) -> List[str]:
-        """Remove expired recordings and return their IDs."""
-        now = datetime.utcnow()
-        expired_ids = []
-        for recording_id, recording in list(self.recordings.items()):
-            if recording["expires_at"] <= now:
-                expired_ids.append(recording_id)
-                del self.recordings[recording_id]
-                # Remove from class_recordings
-                room_code = recording["room_code"]
-                if room_code in self.class_recordings:
-                    self.class_recordings[room_code] = [
-                        rid for rid in self.class_recordings[room_code] if rid != recording_id
-                    ]
-        return expired_ids
 
+    def update_status(self, recording_id: str, status: str, ended_at: Optional[datetime] = None):
+        rec = self.recordings.get(recording_id)
+        if rec:
+            rec["status"] = status
+            if ended_at:
+                rec["ended_at"] = ended_at
+
+    def cleanup_expired(self) -> List[str]:
+        now = datetime.utcnow()
+        expired = [rid for rid, r in self.recordings.items() if r["expires_at"] <= now]
+        for rid in expired:
+            room_code = self.recordings[rid]["room_code"]
+            del self.recordings[rid]
+            if room_code in self.class_recordings:
+                self.class_recordings[room_code] = [
+                    x for x in self.class_recordings[room_code] if x != rid
+                ]
+        return expired
+
+
+# ---------------------------------------------------------------------------
+# Session State
+# ---------------------------------------------------------------------------
 
 class SessionState:
-    """In-memory session state for active classes."""
-    
+    """In-memory state for active class sessions."""
+
     def __init__(self):
         self.active_classes: Dict[str, Dict[str, Any]] = {}
-        self.blocked_participants: Dict[str, List[str]] = {}  # room_code -> [identities]
-        self.teacher_sessions: Dict[str, str] = {}  # identity -> room_code
-    
-    def create_class(
-        self,
-        room_code: str,
-        livekit_room_name: str,
-        class_name: str,
-        teacher_name: str,
-        teacher_identity: str,
-        meeting_passcode_hash: str,
-        max_participants: int,
-        student_microphone_policy: MicrophonePolicy,
-        student_camera_policy: CameraPolicy,
-    ):
+        self.blocked_participants: Dict[str, List[str]] = {}
+        self.teacher_sessions: Dict[str, str] = {}
+
+    def create_class(self, room_code, livekit_room_name, class_name, teacher_name,
+                     teacher_identity, meeting_passcode_hash, max_participants,
+                     student_microphone_policy, student_camera_policy):
         self.active_classes[room_code] = {
-            "livekit_room_name": livekit_room_name,
-            "class_name": class_name,
-            "teacher_name": teacher_name,
-            "teacher_identity": teacher_identity,
-            "meeting_passcode_hash": meeting_passcode_hash,
-            "max_participants": max_participants,
+            "livekit_room_name":        livekit_room_name,
+            "class_name":               class_name,
+            "teacher_name":             teacher_name,
+            "teacher_identity":         teacher_identity,
+            "meeting_passcode_hash":    meeting_passcode_hash,
+            "max_participants":         max_participants,
             "student_microphone_policy": student_microphone_policy,
-            "student_camera_policy": student_camera_policy,
-            "is_locked": False,
-            "is_ended": False,
-            "is_recording": False,
-            "active_recording_id": None,
-            "created_at": datetime.utcnow(),
+            "student_camera_policy":    student_camera_policy,
+            "is_locked":                False,
+            "is_ended":                 False,
+            "is_recording":             False,
+            "active_recording_id":      None,
+            "created_at":               datetime.utcnow(),
         }
         self.teacher_sessions[teacher_identity] = room_code
-    
+
     def get_class(self, room_code: str) -> Optional[Dict[str, Any]]:
         return self.active_classes.get(room_code)
-    
+
     def is_class_active(self, room_code: str) -> bool:
-        class_info = self.get_class(room_code)
-        return class_info is not None and not class_info.get("is_ended", False)
-    
+        c = self.get_class(room_code)
+        return c is not None and not c.get("is_ended", False)
+
     def is_class_locked(self, room_code: str) -> bool:
-        class_info = self.get_class(room_code)
-        return class_info.get("is_locked", False) if class_info else False
-    
+        c = self.get_class(room_code)
+        return c.get("is_locked", False) if c else False
+
     def is_recording(self, room_code: str) -> bool:
-        class_info = self.get_class(room_code)
-        return class_info.get("is_recording", False) if class_info else False
-    
-    def set_recording(self, room_code: str, is_recording: bool, recording_id: Optional[str] = None):
-        class_info = self.get_class(room_code)
-        if class_info:
-            class_info["is_recording"] = is_recording
-            class_info["active_recording_id"] = recording_id
-    
+        c = self.get_class(room_code)
+        return c.get("is_recording", False) if c else False
+
+    def set_recording(self, room_code: str, is_rec: bool, recording_id: Optional[str] = None):
+        c = self.get_class(room_code)
+        if c:
+            c["is_recording"]       = is_rec
+            c["active_recording_id"] = recording_id
+
     def lock_class(self, room_code: str):
-        class_info = self.get_class(room_code)
-        if class_info:
-            class_info["is_locked"] = True
-    
+        c = self.get_class(room_code)
+        if c: c["is_locked"] = True
+
     def unlock_class(self, room_code: str):
-        class_info = self.get_class(room_code)
-        if class_info:
-            class_info["is_locked"] = False
-    
+        c = self.get_class(room_code)
+        if c: c["is_locked"] = False
+
     def end_class(self, room_code: str):
-        class_info = self.get_class(room_code)
-        if class_info:
-            class_info["is_ended"] = True
-    
+        c = self.get_class(room_code)
+        if c: c["is_ended"] = True
+
     def verify_passcode(self, room_code: str, passcode: str) -> bool:
-        class_info = self.get_class(room_code)
-        if not class_info:
-            return False
-        passcode_hash = hashlib.sha256(passcode.encode()).hexdigest()
-        return class_info["meeting_passcode_hash"] == passcode_hash
-    
+        c = self.get_class(room_code)
+        if not c: return False
+        return c["meeting_passcode_hash"] == hashlib.sha256(passcode.encode()).hexdigest()
+
     def block_participant(self, room_code: str, identity: str):
-        if room_code not in self.blocked_participants:
-            self.blocked_participants[room_code] = []
+        self.blocked_participants.setdefault(room_code, [])
         if identity not in self.blocked_participants[room_code]:
             self.blocked_participants[room_code].append(identity)
-    
+
     def unblock_participant(self, room_code: str, identity: str):
         if room_code in self.blocked_participants:
-            if identity in self.blocked_participants[room_code]:
-                self.blocked_participants[room_code].remove(identity)
-    
+            self.blocked_participants[room_code] = [
+                x for x in self.blocked_participants[room_code] if x != identity
+            ]
+
     def is_participant_blocked(self, room_code: str, identity: str) -> bool:
-        return room_code in self.blocked_participants and identity in self.blocked_participants[room_code]
-    
+        return identity in self.blocked_participants.get(room_code, [])
+
     def get_teacher_identity(self, room_code: str) -> Optional[str]:
-        class_info = self.get_class(room_code)
-        return class_info.get("teacher_identity") if class_info else None
-    
+        c = self.get_class(room_code)
+        return c.get("teacher_identity") if c else None
+
     def is_teacher(self, room_code: str, identity: str) -> bool:
-        teacher_identity = self.get_teacher_identity(room_code)
-        return teacher_identity is not None and teacher_identity == identity
-    
+        return self.get_teacher_identity(room_code) == identity
+
     def update_microphone_policy(self, room_code: str, policy: MicrophonePolicy):
-        class_info = self.get_class(room_code)
-        if class_info:
-            class_info["student_microphone_policy"] = policy
-    
+        c = self.get_class(room_code)
+        if c: c["student_microphone_policy"] = policy
+
     def update_camera_policy(self, room_code: str, policy: CameraPolicy):
-        class_info = self.get_class(room_code)
-        if class_info:
-            class_info["student_camera_policy"] = policy
-    
+        c = self.get_class(room_code)
+        if c: c["student_camera_policy"] = policy
+
     def get_microphone_policy(self, room_code: str) -> MicrophonePolicy:
-        class_info = self.get_class(room_code)
-        return class_info.get("student_microphone_policy", MicrophonePolicy.ALLOWED) if class_info else MicrophonePolicy.ALLOWED
-    
+        c = self.get_class(room_code)
+        return c.get("student_microphone_policy", MicrophonePolicy.ALLOWED) if c else MicrophonePolicy.ALLOWED
+
     def get_camera_policy(self, room_code: str) -> CameraPolicy:
-        class_info = self.get_class(room_code)
-        return class_info.get("student_camera_policy", CameraPolicy.ALLOWED) if class_info else CameraPolicy.ALLOWED
-    
-    def cleanup_class(self, room_code: str):
-        if room_code in self.active_classes:
-            teacher_identity = self.active_classes[room_code].get("teacher_identity")
-            if teacher_identity and teacher_identity in self.teacher_sessions:
-                del self.teacher_sessions[teacher_identity]
-            del self.active_classes[room_code]
-        if room_code in self.blocked_participants:
-            del self.blocked_participants[room_code]
+        c = self.get_class(room_code)
+        return c.get("student_camera_policy", CameraPolicy.ALLOWED) if c else CameraPolicy.ALLOWED
 
 
-# Global session state
-session_state = SessionState()
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+session_state   = SessionState()
 recording_state = RecordingState()
 
 
+# ---------------------------------------------------------------------------
+# LiveKit Service
+# ---------------------------------------------------------------------------
+
 class LiveKitService:
-    """Service for interacting with LiveKit Cloud."""
-    
+    """All LiveKit + Supabase S3 operations."""
+
     def __init__(self):
-        self.url = settings.LIVEKIT_URL
-        self.api_key = settings.LIVEKIT_API_KEY
-        self.api_secret = settings.LIVEKIT_API_SECRET
-        # Supabase Storage (S3-compatible)
-        self.s3_endpoint = settings.SUPABASE_S3_ENDPOINT
-        self.s3_access_key = settings.SUPABASE_S3_ACCESS_KEY
-        self.s3_secret_key = settings.SUPABASE_S3_SECRET_KEY
-        self.s3_region = settings.SUPABASE_S3_REGION
-        self.s3_bucket = settings.SUPABASE_S3_BUCKET
-        # Services
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._room_service: Optional[RoomService] = None
-        self._egress_service: Optional[EgressService] = None
-    
-    async def get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session."""
+        self.url            = settings.LIVEKIT_URL
+        self.api_key        = settings.LIVEKIT_API_KEY
+        self.api_secret     = settings.LIVEKIT_API_SECRET
+        self.s3_endpoint    = settings.SUPABASE_S3_ENDPOINT
+        self.s3_access_key  = settings.SUPABASE_S3_ACCESS_KEY
+        self.s3_secret_key  = settings.SUPABASE_S3_SECRET_KEY
+        self.s3_region      = settings.SUPABASE_S3_REGION
+        self.s3_bucket      = settings.SUPABASE_S3_BUCKET
+        self._session:        Optional[aiohttp.ClientSession] = None
+        self._room_service:   Optional[RoomService]           = None
+        self._egress_service: Optional[EgressService]         = None
+
+    # ---- internal helpers ------------------------------------------------
+
+    async def _session_(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
-    
+
     async def get_room_service(self) -> RoomService:
-        """Get or create RoomService."""
         if self._room_service is None:
-            session = await self.get_session()
+            s = await self._session_()
             self._room_service = RoomService(
-                session=session,
-                url=self.url,
-                api_key=self.api_key,
-                api_secret=self.api_secret
-            )
+                session=s, url=self.url,
+                api_key=self.api_key, api_secret=self.api_secret)
         return self._room_service
-    
+
     async def get_egress_service(self) -> EgressService:
-        """Get or create EgressService."""
         if self._egress_service is None:
-            session = await self.get_session()
+            s = await self._session_()
             self._egress_service = EgressService(
-                session=session,
-                url=self.url,
-                api_key=self.api_key,
-                api_secret=self.api_secret
-            )
+                session=s, url=self.url,
+                api_key=self.api_key, api_secret=self.api_secret)
         return self._egress_service
 
+    def _s3_client(self):
+        """Return a boto3 S3 client configured for Supabase."""
+        import boto3
+        from botocore.config import Config
+        return boto3.client(
+            's3',
+            endpoint_url=self.s3_endpoint,
+            aws_access_key_id=self.s3_access_key,
+            aws_secret_access_key=self.s3_secret_key,
+            region_name=self.s3_region,
+            config=Config(signature_version='s3v4'),
+        )
+
+    async def _run_in_thread(self, fn):
+        """Run a sync callable in a thread pool (keeps async loop free)."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, fn)
+
+    # ---- startup check ---------------------------------------------------
+
     async def ensure_bucket_exists(self) -> bool:
-        """Verify the Supabase bucket is accessible using signed S3 request."""
-        import asyncio
+        """Verify Supabase bucket is reachable on startup."""
+        from botocore.exceptions import ClientError
+
+        def _check():
+            try:
+                s3 = self._s3_client()
+                s3.head_bucket(Bucket=self.s3_bucket)
+                return True, f"✓ Supabase bucket '{self.s3_bucket}' is ready for recordings"
+            except ClientError as e:
+                code = e.response['Error']['Code']
+                if code in ('403', '200'):
+                    return True, f"✓ Supabase bucket '{self.s3_bucket}' exists"
+                return False, f"⚠ Bucket '{self.s3_bucket}' not found — create it in Supabase → Storage"
+            except Exception as e:
+                return False, f"⚠ Storage check error: {e}"
+
         try:
-            import boto3
-            from botocore.config import Config
-            from botocore.exceptions import ClientError
-
-            def _check():
-                s3 = boto3.client(
-                    's3',
-                    endpoint_url=self.s3_endpoint,
-                    aws_access_key_id=self.s3_access_key,
-                    aws_secret_access_key=self.s3_secret_key,
-                    region_name=self.s3_region,
-                    config=Config(signature_version='s3v4')
-                )
-                # head_bucket is lightest call — just checks if bucket exists
-                try:
-                    s3.head_bucket(Bucket=self.s3_bucket)
-                    return True, f"✓ Supabase bucket '{self.s3_bucket}' is ready for recordings"
-                except ClientError as e:
-                    code = e.response['Error']['Code']
-                    if code in ('403', '200'):
-                        # Bucket exists but may have restricted access — still OK
-                        return True, f"✓ Supabase bucket '{self.s3_bucket}' exists"
-                    return False, f"⚠ Bucket '{self.s3_bucket}' not found — create it in Supabase dashboard → Storage"
-
-            # Run synchronous boto3 call in thread pool to not block event loop
-            loop = asyncio.get_event_loop()
-            ok, msg = await loop.run_in_executor(None, _check)
+            ok, msg = await self._run_in_thread(_check)
             print(msg)
             return ok
-
         except ImportError:
             print("⚠ boto3 not installed — run: pip install boto3")
             return False
-        except Exception as e:
-            print(f"⚠ Storage check error: {e}")
-            return False
-    
-    def generate_room_code(self) -> str:
-        """Generate a unique application-level room code."""
-        return secrets.token_urlsafe(6).upper()
-    
-    def generate_livekit_room_name(self) -> str:
-        """Generate a secure LiveKit room name."""
-        return f"class_{secrets.token_urlsafe(16)}"
-    
-    def generate_recording_id(self) -> str:
-        """Generate a unique recording ID."""
-        return f"rec_{secrets.token_urlsafe(8)}"
-    
-    def hash_passcode(self, passcode: str) -> str:
-        """Hash a meeting passcode for storage."""
-        return hashlib.sha256(passcode.encode()).hexdigest()
-    
-    def create_access_token(
-        self,
-        identity: str,
-        name: str,
-        room: str,
-        role: str,
-        can_publish: bool = True,
-        can_subscribe: bool = True,
-        can_publish_data: bool = True,
-        is_muted: bool = False,
-        is_camera_off: bool = False,
-    ) -> str:
-        """Generate a LiveKit access token."""
-        token = AccessToken(self.api_key, self.api_secret)
-        
-        # Set identity and name
-        token = token.with_identity(identity).with_name(name)
-        
-        # Add metadata for role identification
-        metadata = f"role:{role}"
-        if is_muted:
-            metadata += ",mic:muted"
-        if is_camera_off:
-            metadata += ",camera:off"
-        token = token.with_metadata(metadata)
-        
-        # Set video grants
-        grants = VideoGrants(
-            room_join=True,
-            room=room,
-            can_publish=can_publish,
-            can_subscribe=can_subscribe,
-            can_publish_data=can_publish_data,
-        )
-        token = token.with_grants(grants)
-        
-        # Set token expiration (6 hours for MVP)
-        token = token.with_ttl(timedelta(hours=6))
-        
+
+    # ---- generators ------------------------------------------------------
+
+    def generate_room_code(self)      -> str: return secrets.token_urlsafe(6).upper()
+    def generate_livekit_room_name(self) -> str: return f"class_{secrets.token_urlsafe(16)}"
+    def generate_recording_id(self)   -> str: return f"rec_{secrets.token_urlsafe(8)}"
+    def hash_passcode(self, p: str)   -> str: return hashlib.sha256(p.encode()).hexdigest()
+
+    # ---- token -----------------------------------------------------------
+
+    def create_access_token(self, identity, name, room, role,
+                             can_publish=True, can_subscribe=True,
+                             can_publish_data=True,
+                             is_muted=False, is_camera_off=False) -> str:
+        token = (AccessToken(self.api_key, self.api_secret)
+                 .with_identity(identity)
+                 .with_name(name)
+                 .with_metadata(f"role:{role}" +
+                                (",mic:muted"   if is_muted      else "") +
+                                (",camera:off"  if is_camera_off else ""))
+                 .with_grants(VideoGrants(
+                     room_join=True, room=room,
+                     can_publish=can_publish,
+                     can_subscribe=can_subscribe,
+                     can_publish_data=can_publish_data))
+                 .with_ttl(timedelta(hours=6)))
         return token.to_jwt()
-    
-    async def create_room(
-        self,
-        livekit_room_name: str,
-        max_participants: int = 50,
-    ) -> bool:
-        """Create a LiveKit room."""
+
+    # ---- room ------------------------------------------------------------
+
+    async def create_room(self, livekit_room_name: str, max_participants: int = 50) -> bool:
         try:
-            room_service = await self.get_room_service()
-            await room_service.create_room(CreateRoomRequest(
-                name=livekit_room_name,
-                max_participants=max_participants,
-            ))
+            rs = await self.get_room_service()
+            await rs.create_room(CreateRoomRequest(name=livekit_room_name, max_participants=max_participants))
             return True
         except Exception as e:
-            # Room might already exist, which is fine
             print(f"Room creation note: {e}")
             return True
-    
+
     async def delete_room(self, livekit_room_name: str):
-        """Delete a LiveKit room."""
         try:
             from livekit.api.room_service import DeleteRoomRequest
-            room_service = await self.get_room_service()
-            await room_service.delete_room(DeleteRoomRequest(room=livekit_room_name))
+            rs = await self.get_room_service()
+            await rs.delete_room(DeleteRoomRequest(room=livekit_room_name))
         except Exception as e:
             print(f"Room deletion note: {e}")
-    
+
     async def get_participants(self, livekit_room_name: str) -> List[Dict[str, Any]]:
-        """Get list of participants in a room."""
         try:
             from livekit.api.room_service import ListParticipantsRequest
-            room_service = await self.get_room_service()
-            participants = await room_service.list_participants(ListParticipantsRequest(room=livekit_room_name))
-            return [
-                {
-                    "identity": p.identity,
-                    "name": p.name,
-                    "state": p.state.name if hasattr(p.state, 'name') else str(p.state),
-                    "metadata": p.metadata,
-                }
-                for p in participants.participants
-            ]
+            rs = await self.get_room_service()
+            resp = await rs.list_participants(ListParticipantsRequest(room=livekit_room_name))
+            return [{"identity": p.identity, "name": p.name,
+                     "state": p.state.name if hasattr(p.state, 'name') else str(p.state),
+                     "metadata": p.metadata}
+                    for p in resp.participants]
         except Exception as e:
             print(f"Error listing participants: {e}")
             return []
-    
+
     async def remove_participant(self, livekit_room_name: str, identity: str):
-        """Remove a participant from the room."""
         try:
             from livekit.api.room_service import RoomParticipantIdentity
-            room_service = await self.get_room_service()
-            await room_service.remove_participant(RoomParticipantIdentity(
-                room=livekit_room_name,
-                identity=identity,
-            ))
+            rs = await self.get_room_service()
+            await rs.remove_participant(RoomParticipantIdentity(room=livekit_room_name, identity=identity))
         except Exception as e:
             print(f"Error removing participant: {e}")
-    
+
     async def mute_participant(self, livekit_room_name: str, identity: str, muted: bool = True):
-        """Mute/unmute a participant's microphone."""
         try:
             from livekit.api.room_service import MuteRoomTrackRequest
-            room_service = await self.get_room_service()
-            await room_service.mute_room_track(MuteRoomTrackRequest(
-                room=livekit_room_name,
-                identity=identity,
-                track_sid="microphone",
-                muted=muted,
-            ))
+            rs = await self.get_room_service()
+            await rs.mute_room_track(MuteRoomTrackRequest(
+                room=livekit_room_name, identity=identity, track_sid="microphone", muted=muted))
         except Exception as e:
             print(f"Error muting participant: {e}")
-    
-    async def mute_all_students(self, livekit_room_name: str, student_identities: List[str]):
-        """Mute all student microphones."""
-        for identity in student_identities:
+
+    async def mute_all_students(self, livekit_room_name: str, identities: List[str]):
+        for identity in identities:
             await self.mute_participant(livekit_room_name, identity, True)
-    
-    async def disable_all_cameras(self, livekit_room_name: str, student_identities: List[str]):
-        """Disable all student cameras."""
-        for identity in student_identities:
+
+    async def disable_all_cameras(self, livekit_room_name: str, identities: List[str]):
+        for identity in identities:
             try:
                 from livekit.api.room_service import MuteRoomTrackRequest
-                room_service = await self.get_room_service()
-                await room_service.mute_room_track(MuteRoomTrackRequest(
-                    room=livekit_room_name,
-                    identity=identity,
-                    track_sid="camera",
-                    muted=True,
-                ))
+                rs = await self.get_room_service()
+                await rs.mute_room_track(MuteRoomTrackRequest(
+                    room=livekit_room_name, identity=identity, track_sid="camera", muted=True))
             except Exception as e:
                 print(f"Error disabling camera for {identity}: {e}")
-    
-    # Recording methods
-    
-    async def start_recording(
-        self,
-        room_code: str,
-        livekit_room_name: str,
-        class_name: str,
-        teacher_name: str,
-    ) -> Dict[str, Any]:
-        """Start recording a class."""
+
+    # ---- recording -------------------------------------------------------
+
+    async def start_recording(self, room_code: str, livekit_room_name: str,
+                               class_name: str, teacher_name: str) -> Dict[str, Any]:
+        """Start a LiveKit Egress recording → saves MP4 to Supabase Storage."""
         try:
-            recording_id = self.generate_recording_id()
-            egress_service = await self.get_egress_service()
-            
-            # Create room composite egress request for recording
-            # This records all participants' video and audio
-            # Use Supabase Storage (S3-compatible)
-            
-            # Configure S3 upload to Supabase Storage
+            recording_id  = self.generate_recording_id()
+            egress_svc    = await self.get_egress_service()
+
             s3_config = S3Upload(
                 access_key=self.s3_access_key,
                 secret=self.s3_secret_key,
                 region=self.s3_region,
                 bucket=self.s3_bucket,
                 endpoint=self.s3_endpoint,
-                force_path_style=True  # Required for Supabase S3-compatible storage
+                force_path_style=True,
             )
-            
-            # Create output with S3 configuration
+
             output = EncodedFileOutput(
                 file_type=EncodedFileType.MP4,
                 filepath=f"recordings/{room_code}/{recording_id}.mp4",
-                s3=s3_config
+                s3=s3_config,
             )
-            
-            request = RoomCompositeEgressRequest(
-                room_name=livekit_room_name,
-                file=output
-            )
-            
-            # Start the egress
-            egress_info = await egress_service.start_room_composite_egress(request)
-            
-            # The egress_id is in the response
-            egress_id = egress_info.egress_id
-            
-            # Store recording state
+
+            req       = RoomCompositeEgressRequest(room_name=livekit_room_name, file=output)
+            egress    = await egress_svc.start_room_composite_egress(req)
+            egress_id = egress.egress_id
+
             recording_state.add_recording(
-                room_code=room_code,
-                recording_id=recording_id,
-                egress_id=egress_id,
-                livekit_room_name=livekit_room_name,
-                class_name=class_name,
-                teacher_name=teacher_name,
-            )
-            
-            # Update class state
+                room_code=room_code, recording_id=recording_id, egress_id=egress_id,
+                livekit_room_name=livekit_room_name, class_name=class_name, teacher_name=teacher_name)
             session_state.set_recording(room_code, True, recording_id)
-            
-            return {
-                "success": True,
-                "recording_id": recording_id,
-                "egress_id": egress_id,
-                "status": "recording",
-            }
+
+            print(f"✓ Recording started: {recording_id} (egress: {egress_id})")
+            return {"success": True, "recording_id": recording_id, "egress_id": egress_id, "status": "recording"}
+
         except Exception as e:
             print(f"Error starting recording: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-            }
-    
+            return {"success": False, "error": str(e)}
+
     async def stop_recording(self, room_code: str, recording_id: str) -> Dict[str, Any]:
-        """Stop recording a class."""
+        """Stop the egress. File will finish uploading to Supabase automatically."""
         try:
-            recording = recording_state.get_recording(recording_id)
-            if not recording:
-                return {"success": False, "error": "Recording not found"}
-            
-            egress_service = await self.get_egress_service()
-            
-            # Stop the egress
+            rec = recording_state.get_recording(recording_id)
+            if not rec:
+                return {"success": False, "error": "Recording not found in session. If server restarted, the recording may still be in Supabase."}
+
             from livekit.api.egress_service import StopEgressRequest
-            egress_info = await egress_service.stop_egress(StopEgressRequest(
-                egress_id=recording["egress_id"]
-            ))
-            
-            # Update recording state
-            recording_state.update_recording_status(
-                recording_id,
-                status="ended",
-                ended_at=datetime.utcnow(),
-                download_url=egress_info.file.location if hasattr(egress_info, 'file') else None,
-            )
-            
-            # Update class state
+            egress_svc = await self.get_egress_service()
+            await egress_svc.stop_egress(StopEgressRequest(egress_id=rec["egress_id"]))
+
+            recording_state.update_status(recording_id, "processing", ended_at=datetime.utcnow())
             session_state.set_recording(room_code, False, None)
-            
-            return {
-                "success": True,
-                "recording_id": recording_id,
-                "status": "ended",
-                "download_url": egress_info.file.location if hasattr(egress_info, 'file') else None,
-            }
+
+            print(f"✓ Recording stopped: {recording_id} — uploading to Supabase...")
+            return {"success": True, "recording_id": recording_id, "status": "processing",
+                    "message": "Recording stopped. File is being saved to Supabase Storage."}
+
         except Exception as e:
             print(f"Error stopping recording: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-            }
-    
-    async def get_recording_status(self, recording_id: str) -> Dict[str, Any]:
-        """Get the status of a recording."""
-        try:
-            recording = recording_state.get_recording(recording_id)
-            if not recording:
-                return {"success": False, "error": "Recording not found"}
-            
-            # If recording is active, check LiveKit status
-            if recording["status"] in ["starting", "recording", "paused"]:
-                egress_service = await self.get_egress_service()
-                from livekit.api.egress_service import ListEgressRequest
-                egress_list = await egress_service.list_egress(ListEgressRequest(
-                    room_name=recording["livekit_room_name"],
-                    egress_id=recording["egress_id"],
-                ))
-                
-                if egress_list.items:
-                    egress_info = egress_list.items[0]
-                    # Update status based on LiveKit response
-                    status_map = {
-                        "EGRESS_STARTING": "starting",
-                        "EGRESS_ACTIVE": "recording",
-                        "EGRESS_ENDING": "ending",
-                        "EGRESS_COMPLETE": "available",
-                        "EGRESS_FAILED": "failed",
-                        "EGRESS_ABORTED": "failed",
-                    }
-                    new_status = status_map.get(egress_info.status.name, recording["status"])
-                    
-                    recording_state.update_recording_status(
-                        recording_id,
-                        status=new_status,
-                        download_url=egress_info.file.location if hasattr(egress_info, 'file') and egress_info.file else None,
-                    )
-            
-            return {
-                "success": True,
-                "recording": recording_state.get_recording(recording_id),
-            }
-        except Exception as e:
-            print(f"Error getting recording status: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-            }
-    
-    def get_class_recordings(self, room_code: str) -> List[Dict[str, Any]]:
-        """Get all recordings for a class."""
-        return recording_state.get_class_recordings(room_code)
-    
-    def get_all_available_recordings(self) -> List[Dict[str, Any]]:
-        """Get all available recordings."""
-        return recording_state.get_available_recordings()
+            return {"success": False, "error": str(e)}
+
+    # ---- list recordings from Supabase S3 (persistent) ------------------
+
+    async def list_recordings_from_storage(self) -> List[Dict[str, Any]]:
+        """
+        Fetch recordings directly from Supabase S3 bucket.
+        Works even after server restart — Supabase is the source of truth.
+        Returns recordings with pre-signed download URLs.
+        """
+        def _fetch():
+            try:
+                from botocore.exceptions import ClientError
+
+                s3        = self._s3_client()
+                results   = []
+                paginator = s3.get_paginator('list_objects_v2')
+
+                for page in paginator.paginate(Bucket=self.s3_bucket, Prefix='recordings/'):
+                    for obj in page.get('Contents', []):
+                        key = obj['Key']          # recordings/ROOMCODE/rec_xxx.mp4
+                        if not key.endswith('.mp4'):
+                            continue
+
+                        parts = key.split('/')
+                        if len(parts) < 3:
+                            continue
+
+                        room_code    = parts[1]
+                        recording_id = parts[2].replace('.mp4', '')
+                        last_modified = obj['LastModified']   # tz-aware
+                        file_size     = obj['Size']
+
+                        expires_at  = last_modified + timedelta(days=3)
+                        now_utc     = datetime.now(timezone.utc)
+
+                        if expires_at <= now_utc:
+                            continue   # expired — skip
+
+                        hours_left     = int((expires_at - now_utc).total_seconds() // 3600)
+                        expiry_seconds = min(int((expires_at - now_utc).total_seconds()), 604800)
+
+                        # Generate pre-signed download URL
+                        try:
+                            download_url = s3.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': self.s3_bucket, 'Key': key},
+                                ExpiresIn=expiry_seconds,
+                            )
+                        except Exception:
+                            download_url = None
+
+                        # Enrich with in-memory metadata if still available
+                        mem = recording_state.get_recording(recording_id)
+
+                        results.append({
+                            "recording_id": recording_id,
+                            "room_code":    room_code,
+                            "class_name":   mem["class_name"]   if mem else f"Class {room_code}",
+                            "teacher_name": mem["teacher_name"] if mem else "Unknown",
+                            "status":       "available",
+                            "started_at":   mem["started_at"].isoformat() if mem else last_modified.isoformat(),
+                            "ended_at":     mem["ended_at"].isoformat()   if (mem and mem.get("ended_at")) else last_modified.isoformat(),
+                            "expires_at":   expires_at.isoformat(),
+                            "hours_left":   hours_left,
+                            "file_size_mb": round(file_size / (1024 * 1024), 2),
+                            "download_url": download_url,
+                            "s3_key":       key,
+                        })
+
+                results.sort(key=lambda r: r["started_at"], reverse=True)
+                return results
+
+            except Exception as e:
+                print(f"Error listing recordings from Supabase: {e}")
+                return []
+
+        return await self._run_in_thread(_fetch)
+
+    async def generate_download_url(self, s3_key: str) -> Optional[str]:
+        """Generate a fresh pre-signed download URL."""
+        def _gen():
+            try:
+                s3 = self._s3_client()
+                return s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': self.s3_bucket, 'Key': s3_key},
+                    ExpiresIn=3 * 24 * 3600,
+                )
+            except Exception as e:
+                print(f"Error generating download URL: {e}")
+                return None
+        return await self._run_in_thread(_gen)
 
 
-# Global LiveKit service instance
+# ---------------------------------------------------------------------------
+# Singletons
+# ---------------------------------------------------------------------------
+
 livekit_service = LiveKitService()
