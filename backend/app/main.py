@@ -49,6 +49,9 @@ async def startup_event():
         print(f"⚠ Configuration warning: {e}")
         print("  Some features may not work correctly without proper LiveKit credentials")
     
+    # Validate Supabase Storage for recordings
+    settings.validate_storage()
+    
     # Start background cleanup task for expired recordings
     asyncio.create_task(cleanup_expired_recordings_task())
 

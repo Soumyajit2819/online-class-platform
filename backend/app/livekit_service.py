@@ -3,7 +3,7 @@ import hashlib
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 import aiohttp
-from livekit.api import AccessToken, VideoGrants
+from livekit.api import AccessToken, VideoGrants, S3Upload
 from livekit.api.room_service import RoomService, CreateRoomRequest
 from livekit.api.egress_service import EgressService, RoomCompositeEgressRequest
 from livekit.api import EncodedFileOutput, EncodedFileType
@@ -235,6 +235,13 @@ class LiveKitService:
         self.url = settings.LIVEKIT_URL
         self.api_key = settings.LIVEKIT_API_KEY
         self.api_secret = settings.LIVEKIT_API_SECRET
+        # Supabase Storage (S3-compatible)
+        self.s3_endpoint = settings.SUPABASE_S3_ENDPOINT
+        self.s3_access_key = settings.SUPABASE_S3_ACCESS_KEY
+        self.s3_secret_key = settings.SUPABASE_S3_SECRET_KEY
+        self.s3_region = settings.SUPABASE_S3_REGION
+        self.s3_bucket = settings.SUPABASE_S3_BUCKET
+        # Services
         self._session: Optional[aiohttp.ClientSession] = None
         self._room_service: Optional[RoomService] = None
         self._egress_service: Optional[EgressService] = None
@@ -434,13 +441,28 @@ class LiveKitService:
             
             # Create room composite egress request for recording
             # This records all participants' video and audio
-            # Use "file" field (singular) for single file output
+            # Use Supabase Storage (S3-compatible)
+            
+            # Configure S3 upload to Supabase Storage
+            s3_config = S3Upload(
+                access_key=self.s3_access_key,
+                secret=self.s3_secret_key,
+                region=self.s3_region,
+                bucket=self.s3_bucket,
+                endpoint=self.s3_endpoint,
+                force_path_style=True  # Required for Supabase S3-compatible storage
+            )
+            
+            # Create output with S3 configuration
+            output = EncodedFileOutput(
+                file_type=EncodedFileType.MP4,
+                filepath=f"recordings/{room_code}/{recording_id}.mp4",
+                s3=s3_config
+            )
+            
             request = RoomCompositeEgressRequest(
                 room_name=livekit_room_name,
-                file=EncodedFileOutput(
-                    file_type=EncodedFileType.MP4,
-                    filepath=f"recordings/{room_code}/{recording_id}.mp4"
-                )
+                file=output
             )
             
             # Start the egress
