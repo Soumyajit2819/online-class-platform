@@ -50,7 +50,10 @@ async def startup_event():
         print("  Some features may not work correctly without proper LiveKit credentials")
     
     # Validate Supabase Storage for recordings
-    settings.validate_storage()
+    if settings.validate_storage():
+        print("✓ Supabase Storage credentials found")
+        # Auto-create bucket if it doesn't exist
+        await livekit_service.ensure_bucket_exists()
     
     # Start background cleanup task for expired recordings
     asyncio.create_task(cleanup_expired_recordings_task())

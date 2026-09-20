@@ -10,7 +10,6 @@ from livekit.api import EncodedFileOutput, EncodedFileType
 from .config import settings
 from .models import MicrophonePolicy, CameraPolicy
 
-
 class RecordingState:
     """In-memory state for class recordings."""
     
@@ -275,6 +274,60 @@ class LiveKitService:
                 api_secret=self.api_secret
             )
         return self._egress_service
+
+    async def ensure_bucket_exists(self) -> bool:
+        """Auto-create the Supabase bucket if it doesn't exist."""
+        # Extract project ref from endpoint URL
+        # e.g. https://mwwqohovmkwulojfsczn.storage.supabase.co/storage/v1/s3
+        try:
+            # Supabase REST API endpoint for storage management
+            # Derive base URL from S3 endpoint
+            # https://mwwqohovmkwulojfsczn.storage.supabase.co/storage/v1/s3
+            # →  https://mwwqohovmkwulojfsczn.supabase.co
+            s3_endpoint = self.s3_endpoint  # e.g. https://xxx.storage.supabase.co/storage/v1/s3
+            # Extract project host
+            # xxx.storage.supabase.co → xxx.supabase.co
+            host = s3_endpoint.replace("https://", "").split("/")[0]  # xxx.storage.supabase.co
+            project_ref = host.split(".")[0]  # xxx
+            api_base = f"https://{project_ref}.supabase.co/storage/v1"
+
+            # Use Supabase service role key to create bucket
+            # We derive it from S3 credentials — for Supabase, secret_key IS the service role key
+            headers = {
+                "Authorization": f"Bearer {self.s3_secret_key}",
+                "Content-Type": "application/json",
+                "apikey": self.s3_secret_key,
+            }
+
+            session = await self.get_session()
+
+            # First check if bucket already exists
+            async with session.get(f"{api_base}/bucket/{self.s3_bucket}", headers=headers) as resp:
+                if resp.status == 200:
+                    print(f"✓ Supabase bucket '{self.s3_bucket}' already exists")
+                    return True
+
+            # Bucket doesn't exist — create it
+            payload = {
+                "id": self.s3_bucket,
+                "name": self.s3_bucket,
+                "public": True,
+                "allowed_mime_types": ["video/mp4", "video/*"],
+                "file_size_limit": 5368709120  # 5GB
+            }
+            async with session.post(f"{api_base}/bucket", json=payload, headers=headers) as resp:
+                if resp.status in (200, 201):
+                    print(f"✓ Supabase bucket '{self.s3_bucket}' created successfully")
+                    return True
+                else:
+                    body = await resp.text()
+                    print(f"⚠ Could not create bucket: {resp.status} - {body}")
+                    print(f"  Please manually create bucket '{self.s3_bucket}' in Supabase dashboard")
+                    return False
+        except Exception as e:
+            print(f"⚠ Bucket check/create error: {e}")
+            print(f"  Please manually create bucket '{self.s3_bucket}' in Supabase dashboard")
+            return False
     
     def generate_room_code(self) -> str:
         """Generate a unique application-level room code."""
