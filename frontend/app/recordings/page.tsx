@@ -3,43 +3,29 @@
 import { useEffect, useState, useCallback } from 'react'
 import Link from 'next/link'
 import { api, Recording } from '@/lib/api'
+import PasscodeGate from '@/components/PasscodeGate'
 
 // ---------------------------------------------------------------------------
-// Countdown hook — re-renders every second
+// Countdown hook
 // ---------------------------------------------------------------------------
 function useCountdown(expiresAt: string) {
   const calc = () => {
     const diff = new Date(expiresAt).getTime() - Date.now()
     if (diff <= 0) return { expired: true, text: 'Expired', pct: 0, urgent: false }
-
-    const totalMs = 20 * 60 * 60 * 1000   // 20 hours in ms
+    const totalMs = 20 * 60 * 60 * 1000
     const pct     = Math.max(0, Math.min(100, (diff / totalMs) * 100))
-
     const h = Math.floor(diff / 3600000)
     const m = Math.floor((diff % 3600000) / 60000)
     const s = Math.floor((diff % 60000) / 1000)
-
-    const text = h > 0
-      ? `${h}h ${m}m left`
-      : m > 0
-        ? `${m}m ${s}s left`
-        : `${s}s left`
-
-    return { expired: false, text, pct, urgent: diff < 2 * 3600000 } // urgent if < 2h
+    const text = h > 0 ? `${h}h ${m}m left` : m > 0 ? `${m}m ${s}s left` : `${s}s left`
+    return { expired: false, text, pct, urgent: diff < 2 * 3600000 }
   }
-
   const [state, setState] = useState(calc)
-
   useEffect(() => {
     setState(calc())
-    const id = setInterval(() => {
-      const next = calc()
-      setState(next)
-      if (next.expired) clearInterval(id)
-    }, 1000)
+    const id = setInterval(() => { const n = calc(); setState(n); if (n.expired) clearInterval(id) }, 1000)
     return () => clearInterval(id)
   }, [expiresAt])
-
   return state
 }
 
@@ -139,6 +125,27 @@ function RecordingCard({ recording, onDownload }: {
 // Main page
 // ---------------------------------------------------------------------------
 export default function RecordingsPage() {
+  const [unlocked, setUnlocked] = useState(false)
+
+  if (!unlocked) {
+    return (
+      <PasscodeGate
+        title="Recordings Access"
+        description="Enter the passcode to view and download class recordings"
+        icon="📹"
+        onVerify={async (passcode) => {
+          await api.verifyRecordingsPasscode(passcode)
+          return true
+        }}
+        onSuccess={() => setUnlocked(true)}
+      />
+    )
+  }
+
+  return <RecordingsList />
+}
+
+function RecordingsList() {
   const [recordings, setRecordings]   = useState<Recording[]>([])
   const [loading, setLoading]         = useState(true)
   const [error, setError]             = useState('')

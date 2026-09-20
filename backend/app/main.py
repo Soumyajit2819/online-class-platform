@@ -13,6 +13,7 @@ from .models import (
     MicrophonePolicy, CameraPolicy,
 )
 from .livekit_service import livekit_service, session_state, recording_state
+from .passcode_service import passcode_service
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -48,6 +49,10 @@ async def startup_event():
     if settings.validate_storage():
         print("✓ Supabase Storage credentials found")
         await livekit_service.ensure_bucket_exists()
+
+    if settings.validate_supabase_db():
+        print("✓ Supabase DB credentials found")
+        await passcode_service.init_db()
 
     asyncio.create_task(_cleanup_loop())
 
@@ -393,3 +398,104 @@ async def get_download_url(recording_id: str):
         "hours_left":   rec["hours_left"],
         "file_size_mb": rec["file_size_mb"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Passcode verification endpoints
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel as PydanticBase
+
+class PasscodeRequest(PydanticBase):
+    passcode: str
+
+class AdminLoginRequest(PydanticBase):
+    password: str
+
+class UpdatePasscodeRequest(PydanticBase):
+    admin_password: str
+    new_passcode: str
+
+
+@app.post("/api/auth/verify-teacher-passcode")
+async def verify_teacher_passcode(request: PasscodeRequest):
+    """
+    Verify teacher access passcode.
+    Frontend calls this before showing the teacher/create-class page.
+    """
+    if not request.passcode or not request.passcode.strip():
+        raise HTTPException(400, "Passcode is required")
+
+    if passcode_service.verify_teacher_passcode(request.passcode):
+        return {"success": True, "message": "Access granted"}
+    else:
+        raise HTTPException(403, "Invalid passcode")
+
+
+@app.post("/api/auth/verify-recordings-passcode")
+async def verify_recordings_passcode(request: PasscodeRequest):
+    """
+    Verify recordings access passcode.
+    Frontend calls this before showing the recordings page.
+    """
+    if not request.passcode or not request.passcode.strip():
+        raise HTTPException(400, "Passcode is required")
+
+    if passcode_service.verify_recordings_passcode(request.passcode):
+        return {"success": True, "message": "Access granted"}
+    else:
+        raise HTTPException(403, "Invalid passcode")
+
+
+@app.post("/api/admin/login")
+async def admin_login(request: AdminLoginRequest):
+    """Verify admin dashboard password."""
+    if not request.password or not request.password.strip():
+        raise HTTPException(400, "Password is required")
+
+    if not settings.ADMIN_DASHBOARD_PASSWORD:
+        raise HTTPException(503, "Admin dashboard is not configured. Set ADMIN_DASHBOARD_PASSWORD in .env")
+
+    if passcode_service.verify_admin_password(request.password):
+        return {"success": True, "message": "Admin access granted"}
+    else:
+        raise HTTPException(403, "Invalid admin password")
+
+
+@app.post("/api/admin/update-teacher-passcode")
+async def update_teacher_passcode(request: UpdatePasscodeRequest):
+    """Update teacher access passcode (admin only)."""
+    if not passcode_service.verify_admin_password(request.admin_password):
+        raise HTTPException(403, "Invalid admin password")
+
+    if not request.new_passcode or len(request.new_passcode.strip()) < 6:
+        raise HTTPException(400, "New passcode must be at least 6 characters")
+
+    if passcode_service.update_teacher_passcode(request.new_passcode):
+        return {"success": True, "message": "Teacher passcode updated"}
+    else:
+        raise HTTPException(500, "Failed to update passcode")
+
+
+@app.post("/api/admin/update-recordings-passcode")
+async def update_recordings_passcode(request: UpdatePasscodeRequest):
+    """Update recordings access passcode (admin only)."""
+    if not passcode_service.verify_admin_password(request.admin_password):
+        raise HTTPException(403, "Invalid admin password")
+
+    if not request.new_passcode or len(request.new_passcode.strip()) < 6:
+        raise HTTPException(400, "New passcode must be at least 6 characters")
+
+    if passcode_service.update_recordings_passcode(request.new_passcode):
+        return {"success": True, "message": "Recordings passcode updated"}
+    else:
+        raise HTTPException(500, "Failed to update passcode")
+
+
+@app.get("/api/admin/passcode-status")
+async def get_passcode_status():
+    """
+    Returns whether passcodes are configured.
+    Does NOT return the passcode or hash — safe to call publicly.
+    """
+    return passcode_service.get_passcode_info()

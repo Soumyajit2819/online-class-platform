@@ -249,6 +249,47 @@ export const api = {
     });
   },
 
+  // Passcode verification
+  async verifyTeacherPasscode(passcode: string): Promise<{ success: boolean; message: string }> {
+    return fetchApi('/api/auth/verify-teacher-passcode', {
+      method: 'POST',
+      body: JSON.stringify({ passcode }),
+    });
+  },
+
+  async verifyRecordingsPasscode(passcode: string): Promise<{ success: boolean; message: string }> {
+    return fetchApi('/api/auth/verify-recordings-passcode', {
+      method: 'POST',
+      body: JSON.stringify({ passcode }),
+    });
+  },
+
+  // Admin endpoints
+  async adminLogin(password: string): Promise<{ success: boolean; message: string }> {
+    return fetchApi('/api/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    });
+  },
+
+  async updateTeacherPasscode(adminPassword: string, newPasscode: string): Promise<{ success: boolean; message: string }> {
+    return fetchApi('/api/admin/update-teacher-passcode', {
+      method: 'POST',
+      body: JSON.stringify({ admin_password: adminPassword, new_passcode: newPasscode }),
+    });
+  },
+
+  async updateRecordingsPasscode(adminPassword: string, newPasscode: string): Promise<{ success: boolean; message: string }> {
+    return fetchApi('/api/admin/update-recordings-passcode', {
+      method: 'POST',
+      body: JSON.stringify({ admin_password: adminPassword, new_passcode: newPasscode }),
+    });
+  },
+
+  async getPasscodeStatus(): Promise<{ teacher_passcode_set: boolean; recordings_passcode_set: boolean; admin_password_set: boolean }> {
+    return fetchApi('/api/admin/passcode-status');
+  },
+
   // Class info endpoints
   async getClassInfo(roomCode: string): Promise<ClassInfo> {
     return fetchApi(`/api/class/${roomCode}`);
