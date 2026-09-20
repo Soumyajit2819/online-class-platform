@@ -436,24 +436,24 @@ class LiveKitService:
             # This records all participants' video and audio
             request = RoomCompositeEgressRequest(
                 room_name=livekit_room_name,
-                # Output to MP4 file
-                file=EncodedFileOutput(
+                # Output to MP4 file - use file_outputs as a list
+                file_outputs=[EncodedFileOutput(
                     file_type=EncodedFileType.MP4,
-                    filepath=f"recordings/{room_code}/{recording_id}.mp4",
-                    # For MVP, we'll use LiveKit's built-in storage
-                    # In production, you'd configure S3/GCP/Azure upload
-                    # s3=S3Upload(...) if you have S3 configured
-                )
+                    filepath=f"recordings/{room_code}/{recording_id}.mp4"
+                )]
             )
             
             # Start the egress
             egress_info = await egress_service.start_room_composite_egress(request)
             
+            # The egress_id is in the response
+            egress_id = egress_info.egress_id
+            
             # Store recording state
             recording_state.add_recording(
                 room_code=room_code,
                 recording_id=recording_id,
-                egress_id=egress_info.egress_id,
+                egress_id=egress_id,
                 livekit_room_name=livekit_room_name,
                 class_name=class_name,
                 teacher_name=teacher_name,
@@ -465,7 +465,7 @@ class LiveKitService:
             return {
                 "success": True,
                 "recording_id": recording_id,
-                "egress_id": egress_info.egress_id,
+                "egress_id": egress_id,
                 "status": "recording",
             }
         except Exception as e:
