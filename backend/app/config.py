@@ -42,7 +42,7 @@ class Settings:
             print(f"⚠ Warning: Missing storage credentials: {', '.join(missing)}")
             print("  Recording feature will not work without storage configuration")
             return False
-        return True True
+        return True
 
 
 settings = Settings()
