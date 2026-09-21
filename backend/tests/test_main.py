@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 import sys
 import os
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -200,6 +201,224 @@ class TestWaitingRoom:
             assert repeated.status_code == 403
 
 
+class TestMicrophoneRestrictions:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("duration", [1, 5, 10, 15, 30])
+    @patch("app.main._schedule_microphone_restriction_expiry")
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.mute_participant", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_teacher_can_create_timed_microphone_restriction(self, mock_create, mock_participants, mock_mute, mock_permission, mock_schedule, duration):
+        mock_create.return_value = True
+        mock_participants.return_value = [{"identity": "student_1", "name": "Alice"}]
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            response = await c.post("/api/teacher/restrict-student-microphone", json={"room_code": room_code, "teacher_identity": teacher_identity, "target_identity": "student_1", "duration_minutes": duration})
+        assert response.status_code == 200
+        assert response.json()["mode"] == "TIMED"
+        payload = response.json()
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+        assert expires_at.tzinfo is not None
+        assert duration * 60 - 1 <= payload["remaining_seconds"] <= duration * 60
+        assert expires_at > datetime.now(timezone.utc)
+        mock_schedule.assert_called_once()
+        mock_mute.assert_awaited_once()
+        mock_permission.assert_awaited_once_with(session_state.get_class(room_code)["livekit_room_name"], "student_1", False)
+
+    @pytest.mark.asyncio
+    @patch("app.main._schedule_microphone_restriction_expiry")
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.mute_participant", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_until_teacher_unmutes_restriction_and_manual_release(self, mock_create, mock_participants, mock_mute, mock_permission, mock_schedule):
+        mock_create.return_value = True
+        mock_participants.return_value = [{"identity": "student_1", "name": "Alice"}]
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            restricted = await c.post("/api/teacher/restrict-student-microphone", json={"room_code": room_code, "teacher_identity": teacher_identity, "target_identity": "student_1"})
+            assert restricted.status_code == 200
+            assert restricted.json()["mode"] == "UNTIL_TEACHER"
+            status = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1")
+            assert status.json()["restricted"] is True
+            released = await c.post("/api/teacher/unrestrict-student-microphone", json={"room_code": room_code, "teacher_identity": teacher_identity, "target_identity": "student_1"})
+        assert released.status_code == 200
+        assert session_state.get_microphone_restriction(room_code, "student_1") is None
+        assert mock_permission.await_count == 2
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_expired_restriction_is_inactive_and_restores_permission(self, mock_create, mock_permission):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            restriction = session_state.set_microphone_restriction(room_code, "student_1", 1)
+            restriction["expires_at"] = restriction["expires_at"] - timedelta(minutes=2)
+            status = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1")
+        assert status.status_code == 200
+        assert status.json()["restricted"] is False
+        mock_permission.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_expiry_task_restores_permission_without_client_polling(self, mock_create, mock_permission):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+        room_code = created.json()["room_code"]
+        restriction = session_state.set_microphone_restriction(room_code, "student_1", 1)
+        restriction["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await __import__("app.main", fromlist=["_restore_microphone_after_expiry"])._restore_microphone_after_expiry(
+            room_code, "student_1", restriction["expires_at"])
+        assert session_state.get_microphone_restriction(room_code, "student_1") is None
+        mock_permission.assert_awaited_once_with(
+            session_state.get_class(room_code)["livekit_room_name"], "student_1", True)
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_teacher_poll_cannot_consume_expiry_before_callback_restores_livekit(self, mock_create, mock_participants, mock_permission):
+        mock_create.return_value = True
+        mock_participants.return_value = []
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            restriction = session_state.set_microphone_restriction(room_code, "student_1", 1)
+            restriction["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            await c.get(f"/api/class/{room_code}/participants")
+        assert session_state.get_microphone_restriction(room_code, "student_1") is not None
+        await __import__("app.main", fromlist=["_restore_microphone_after_expiry"])._restore_microphone_after_expiry(
+            room_code, "student_1", restriction["expires_at"])
+        assert session_state.get_microphone_restriction(room_code, "student_1") is None
+        mock_permission.assert_awaited_once_with(
+            session_state.get_class(room_code)["livekit_room_name"], "student_1", True)
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_old_expiry_callback_cannot_release_newer_restriction(self, mock_create, mock_permission):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+        room_code = created.json()["room_code"]
+        old = session_state.set_microphone_restriction(room_code, "student_1", 1)
+        newer = session_state.set_microphone_restriction(room_code, "student_1", 1)
+        old["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await __import__("app.main", fromlist=["_restore_microphone_after_expiry"])._restore_microphone_after_expiry(
+            room_code, "student_1", old["expires_at"])
+        # A callback only releases the exact expires_at value it scheduled.
+        assert session_state.get_microphone_restriction(room_code, "student_1") == newer
+        assert newer != old
+        mock_permission.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_unauthorized_user_cannot_change_restriction(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            response = await c.post("/api/teacher/restrict-student-microphone", json={"room_code": room_code, "teacher_identity": "student_1", "target_identity": "student_2", "duration_minutes": 1})
+        assert response.status_code == 403
+
+    @staticmethod
+    async def _approved_student(client, room_code, teacher_identity, teacher_access_key, session_id="z" * 36):
+        pending = await client.post("/api/student/join-requests", json={
+            "student_name": "Alice", "room_code": room_code,
+            "meeting_passcode": "abc123", "session_id": session_id,
+        })
+        request_id = pending.json()["request_id"]
+        approved = await client.post("/api/teacher/approve-join-request", json={
+            "room_code": room_code, "teacher_identity": teacher_identity,
+            "teacher_access_key": teacher_access_key, "request_id": request_id,
+        })
+        assert approved.status_code == 200
+        return request_id, session_id
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_access_token", return_value="student-token")
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_rejoin_before_expiry_token_excludes_only_microphone(self, mock_create, mock_participants, mock_token):
+        mock_create.return_value = True
+        mock_participants.return_value = []
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            request_id, session_id = await self._approved_student(c, room_code, teacher_identity, created.json()["teacher_access_key"])
+            student_identity = session_state.get_join_request(request_id)["student_identity"]
+            session_state.set_microphone_restriction(room_code, student_identity, 1)
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+        assert token.status_code == 200
+        assert mock_token.call_args.kwargs["can_publish_sources"] == ["screen_share", "screen_share_audio", "camera"]
+        assert mock_token.call_args.kwargs["is_muted"] is True
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_access_token", return_value="student-token")
+    @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_rejoin_after_expiry_restores_microphone_permission_but_starts_muted(self, mock_create, mock_participants, mock_permission, mock_token):
+        mock_create.return_value = True
+        mock_participants.return_value = []
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            request_id, session_id = await self._approved_student(c, room_code, teacher_identity, created.json()["teacher_access_key"])
+            student_identity = session_state.get_join_request(request_id)["student_identity"]
+            restriction = session_state.set_microphone_restriction(room_code, student_identity, 1)
+            restriction["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+        assert token.status_code == 200
+        assert "microphone" in mock_token.call_args.kwargs["can_publish_sources"]
+        assert mock_permission.await_args == ((session_state.get_class(room_code)["livekit_room_name"], student_identity, True),)
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_access_token", return_value="student-token")
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_until_teacher_restriction_survives_rejoin(self, mock_create, mock_participants, mock_token):
+        mock_create.return_value = True
+        mock_participants.return_value = []
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            request_id, session_id = await self._approved_student(c, room_code, teacher_identity, created.json()["teacher_access_key"])
+            student_identity = session_state.get_join_request(request_id)["student_identity"]
+            session_state.set_microphone_restriction(room_code, student_identity, None)
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+        assert token.status_code == 200
+        assert "microphone" not in mock_token.call_args.kwargs["can_publish_sources"]
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_access_token", return_value="student-token")
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_normal_student_token_keeps_microphone_camera_and_screen_share(self, mock_create, mock_participants, mock_token):
+        mock_create.return_value = True
+        mock_participants.return_value = []
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
+            room_code = created.json()["room_code"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            request_id, session_id = await self._approved_student(c, room_code, teacher_identity, created.json()["teacher_access_key"])
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+        assert token.status_code == 200
+        assert mock_token.call_args.kwargs["can_publish_sources"] == ["screen_share", "screen_share_audio", "microphone", "camera"]
+
+
 # ---------------------------------------------------------------------------
 # Moderation — 403 for non-teachers
 # ---------------------------------------------------------------------------
@@ -287,6 +506,29 @@ class TestTokenGeneration:
         )
         assert isinstance(token, str)
         assert len(token) > 50
+
+    @pytest.mark.asyncio
+    async def test_livekit_microphone_restore_preserves_existing_sources_and_verifies_response(self):
+        from livekit.protocol.models import ParticipantPermission, TrackSource
+
+        existing = MagicMock(permission=ParticipantPermission(
+            can_subscribe=True, can_publish=True, can_publish_data=True,
+            can_publish_sources=[TrackSource.CAMERA, TrackSource.SCREEN_SHARE],
+        ))
+        updated = MagicMock(permission=ParticipantPermission(
+            can_subscribe=True, can_publish=True, can_publish_data=True,
+            can_publish_sources=[TrackSource.CAMERA, TrackSource.SCREEN_SHARE, TrackSource.MICROPHONE],
+        ))
+        room_service = MagicMock()
+        room_service.get_participant = AsyncMock(return_value=existing)
+        room_service.update_participant = AsyncMock(return_value=updated)
+        with patch.object(livekit_service, "get_room_service", new_callable=AsyncMock, return_value=room_service):
+            await livekit_service.set_microphone_publish_permission("room_1", "student_1", True)
+
+        update = room_service.update_participant.await_args.args[0]
+        assert TrackSource.MICROPHONE in update.permission.can_publish_sources
+        assert TrackSource.CAMERA in update.permission.can_publish_sources
+        assert TrackSource.SCREEN_SHARE in update.permission.can_publish_sources
 
 
 # ---------------------------------------------------------------------------

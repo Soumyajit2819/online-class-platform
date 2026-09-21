@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from enum import Enum
 
 
@@ -69,6 +69,19 @@ class ModerationRequest(BaseModel):
     room_code: str
     teacher_identity: str
     target_identity: Optional[str] = None
+
+
+class StudentMuteRestrictionRequest(BaseModel):
+    room_code: str
+    teacher_identity: str
+    target_identity: str
+    duration_minutes: Optional[Literal[1, 5, 10, 15, 30]] = None
+
+
+class StudentUnmuteRestrictionRequest(BaseModel):
+    room_code: str
+    teacher_identity: str
+    target_identity: str
 
 
 class MuteAllRequest(BaseModel):

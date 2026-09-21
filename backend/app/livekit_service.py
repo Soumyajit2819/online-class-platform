@@ -78,6 +78,7 @@ class SessionState:
         self.invite_codes: Dict[str, str] = {}
         self.join_requests: Dict[str, Dict[str, Any]] = {}
         self.join_request_sessions: Dict[tuple[str, str], str] = {}
+        self.microphone_restrictions: Dict[tuple[str, str], Dict[str, Any]] = {}
 
     def create_class(self, room_code, livekit_room_name, class_name, teacher_name,
                      teacher_identity, meeting_passcode_hash, max_participants,
@@ -154,6 +155,53 @@ class SessionState:
 
     def is_participant_blocked(self, room_code: str, identity: str) -> bool:
         return identity in self.blocked_participants.get(room_code, [])
+
+    def set_microphone_restriction(self, room_code: str, identity: str,
+                                   duration_minutes: Optional[int]) -> Dict[str, Any]:
+        # These values cross the API boundary.  Keep them timezone-aware so an
+        # ISO value is always interpreted as UTC by browser clients.
+        now = datetime.now(timezone.utc)
+        restriction = {
+            "room_code": room_code,
+            "identity": identity,
+            "mode": "TIMED" if duration_minutes else "UNTIL_TEACHER",
+            "expires_at": now + timedelta(minutes=duration_minutes) if duration_minutes else None,
+            "updated_at": now,
+        }
+        self.microphone_restrictions[(room_code, identity)] = restriction
+        return restriction
+
+    def get_microphone_restriction(self, room_code: str, identity: str) -> Optional[Dict[str, Any]]:
+        # Reading a restriction must not expire it.  The timed-expiry callback
+        # owns the transition so it can restore LiveKit permission atomically
+        # with removing the server-side restriction.
+        return self.microphone_restrictions.get((room_code, identity))
+
+    def expire_microphone_restriction(self, room_code: str, identity: str,
+                                      expected_expires_at: Optional[datetime] = None) -> bool:
+        key = (room_code, identity)
+        restriction = self.microphone_restrictions.get(key)
+        if expected_expires_at is not None and (
+            not restriction or restriction["expires_at"] != expected_expires_at
+        ):
+            return False
+        if restriction and restriction["expires_at"] and restriction["expires_at"] <= datetime.now(timezone.utc):
+            del self.microphone_restrictions[key]
+            return True
+        return False
+
+    def clear_microphone_restriction(self, room_code: str, identity: str) -> bool:
+        return self.microphone_restrictions.pop((room_code, identity), None) is not None
+
+    def get_class_microphone_restrictions(self, room_code: str) -> Dict[str, Dict[str, Any]]:
+        active = {}
+        for (request_room_code, identity) in list(self.microphone_restrictions):
+            if request_room_code != room_code:
+                continue
+            restriction = self.get_microphone_restriction(room_code, identity)
+            if restriction:
+                active[identity] = restriction
+        return active
 
     def get_room_code_for_invite(self, invite_code: str) -> Optional[str]:
         return self.invite_codes.get(invite_code)
@@ -330,7 +378,8 @@ class LiveKitService:
     def create_access_token(self, identity, name, room, role,
                              can_publish=True, can_subscribe=True,
                              can_publish_data=True,
-                             is_muted=False, is_camera_off=False) -> str:
+                             is_muted=False, is_camera_off=False,
+                             can_publish_sources: Optional[List[str]] = None) -> str:
         token = (AccessToken(self.api_key, self.api_secret)
                  .with_identity(identity)
                  .with_name(name)
@@ -341,7 +390,8 @@ class LiveKitService:
                      room_join=True, room=room,
                      can_publish=can_publish,
                      can_subscribe=can_subscribe,
-                     can_publish_data=can_publish_data))
+                     can_publish_data=can_publish_data,
+                     can_publish_sources=can_publish_sources))
                  .with_ttl(timedelta(hours=6)))
         return token.to_jwt()
 
@@ -420,6 +470,47 @@ class LiveKitService:
 
         except Exception as e:
             print(f"Error muting participant {identity}: {e}")
+
+    async def set_microphone_publish_permission(self, livekit_room_name: str,
+                                                 identity: str, allowed: bool):
+        """Change only microphone publishing and verify LiveKit accepted it."""
+        from livekit.api.room_service import (
+            UpdateParticipantRequest, RoomParticipantIdentity,
+        )
+        from livekit.protocol.models import ParticipantPermission, TrackSource
+
+        rs = await self.get_room_service()
+        participant = await rs.get_participant(RoomParticipantIdentity(
+            room=livekit_room_name, identity=identity))
+        current = participant.permission
+        sources = list(current.can_publish_sources)
+        if not sources:
+            # Compatibility fallback for participants who joined before
+            # source-level grants were introduced.
+            sources = [TrackSource.CAMERA, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO]
+            if current.can_publish:
+                sources.append(TrackSource.MICROPHONE)
+        sources = [source for source in sources if source != TrackSource.MICROPHONE]
+        if allowed:
+            sources.append(TrackSource.MICROPHONE)
+
+        updated = await rs.update_participant(UpdateParticipantRequest(
+            room=livekit_room_name,
+            identity=identity,
+            permission=ParticipantPermission(
+                can_subscribe=current.can_subscribe,
+                can_publish=True,
+                can_publish_data=current.can_publish_data,
+                can_publish_sources=sources,
+            ),
+        ))
+        if allowed and TrackSource.MICROPHONE not in updated.permission.can_publish_sources:
+            raise RuntimeError(
+                f"LiveKit did not restore microphone publish permission for {identity}")
+        if not allowed and TrackSource.MICROPHONE in updated.permission.can_publish_sources:
+            raise RuntimeError(
+                f"LiveKit did not remove microphone publish permission for {identity}")
+        return updated
 
     async def mute_all_students(self, livekit_room_name: str, identities: List[str]):
         for identity in identities:

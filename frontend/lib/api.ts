@@ -64,8 +64,18 @@ export interface Participant {
 export interface ParticipantsResponse {
   room_code: string;
   participants: Participant[];
+  microphone_restrictions: Record<string, MicrophoneRestriction>;
   count: number;
   max_participants: number;
+}
+
+export interface MicrophoneRestriction {
+  restricted: boolean;
+  mode?: 'TIMED' | 'UNTIL_TEACHER';
+  expires_at?: string | null;
+  updated_at?: string;
+  server_time: string;
+  remaining_seconds?: number | null;
 }
 
 export interface ModerationRequest {
@@ -186,6 +196,18 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     });
+  },
+
+  async restrictStudentMicrophone(data: ModerationRequest & { duration_minutes?: 1 | 5 | 10 | 15 | 30 }): Promise<MicrophoneRestriction> {
+    return fetchApi('/api/teacher/restrict-student-microphone', { method: 'POST', body: JSON.stringify(data) });
+  },
+
+  async unrestrictStudentMicrophone(data: ModerationRequest): Promise<{ success: boolean; message: string }> {
+    return fetchApi('/api/teacher/unrestrict-student-microphone', { method: 'POST', body: JSON.stringify(data) });
+  },
+
+  async getStudentMicrophoneRestriction(roomCode: string, studentIdentity: string): Promise<MicrophoneRestriction> {
+    return fetchApi(`/api/class/${encodeURIComponent(roomCode)}/microphone-restriction/${encodeURIComponent(studentIdentity)}`);
   },
 
   async setMicrophonePolicy(data: SetPolicyRequest): Promise<{ success: boolean; message: string }> {

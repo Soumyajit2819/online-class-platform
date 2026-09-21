@@ -15,7 +15,7 @@ import {
 } from '@livekit/components-react'
 import '@livekit/components-styles'
 import { Track, RoomEvent, Participant, Room } from 'livekit-client'
-import { api, Participant as ApiParticipant, JoinRequest } from '@/lib/api'
+import { api, Participant as ApiParticipant, JoinRequest, MicrophoneRestriction } from '@/lib/api'
 
 interface VideoConferenceProps {
   token: string
@@ -39,7 +39,9 @@ export default function VideoConferenceComponent({
   return (
     <LiveKitRoom
       video={true}
-      audio={true}
+      // Students always begin with their microphone off. Authorization to
+      // publish remains server-side and the control bar enables it manually.
+      audio={isTeacher}
       token={token}
       serverUrl={serverUrl}
       connect={true}
@@ -82,6 +84,8 @@ function ClassroomContent({
   )
 
   const [participantsList, setParticipantsList] = useState<ApiParticipant[]>([])
+  const [microphoneRestrictions, setMicrophoneRestrictions] = useState<Record<string, MicrophoneRestriction>>({})
+  const [myMicrophoneRestriction, setMyMicrophoneRestriction] = useState<MicrophoneRestriction | null>(null)
   const [isLocked, setIsLocked] = useState(false)
   const [isEnded, setIsEnded] = useState(false)
   const [micPolicy, setMicPolicy] = useState<'allowed' | 'muted_by_default' | 'locked'>('allowed')
@@ -96,10 +100,30 @@ function ClassroomContent({
     try {
       const response = await api.getParticipants(roomCode)
       setParticipantsList(response.participants)
+      setMicrophoneRestrictions(response.microphone_restrictions || {})
     } catch (err) {
       console.error('Failed to fetch participants:', err)
     }
   }, [roomCode])
+
+  useEffect(() => {
+    const identity = localParticipant.localParticipant?.identity
+    if (isTeacher || !identity) return
+    let active = true
+    const fetchRestriction = async () => {
+      try {
+        const restriction = await api.getStudentMicrophoneRestriction(roomCode, identity)
+        if (!active) return
+        setMyMicrophoneRestriction(restriction)
+        if (restriction.restricted) await localParticipant.localParticipant?.setMicrophoneEnabled(false)
+      } catch {
+        // Preserve normal controls during a temporary status-polling failure.
+      }
+    }
+    fetchRestriction()
+    const timer = window.setInterval(fetchRestriction, 2500)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [isTeacher, localParticipant.localParticipant, roomCode])
 
   // Fetch class info
   const fetchClassInfo = useCallback(async () => {
@@ -195,12 +219,15 @@ function ClassroomContent({
 
       {/* Control bar */}
       <div className="shrink-0 bg-gray-800 border-t border-gray-700 lg:col-span-full lg:row-start-3">
+        {!isTeacher && myMicrophoneRestriction?.restricted && (
+          <MicrophoneRestrictionNotice restriction={myMicrophoneRestriction} />
+        )}
         <div className="[&_.lk-control-bar]:flex-wrap [&_.lk-control-bar]:justify-center">
           <ControlBar
             variation="verbose"
             controls={{
               camera: !isTeacher && cameraPolicy === 'locked' ? false : true,
-              microphone: !isTeacher && micPolicy === 'locked' ? false : true,
+              microphone: !isTeacher && (micPolicy === 'locked' || myMicrophoneRestriction?.restricted) ? false : true,
               screenShare: true,
               leave: true,
               chat: false,
@@ -228,6 +255,7 @@ function ClassroomContent({
             teacherIdentity={teacherIdentity}
             teacherAccessKey={teacherAccessKey}
             participants={participantsList}
+            microphoneRestrictions={microphoneRestrictions}
             isLocked={isLocked}
             isRecording={isRecording}
             activeRecordingId={activeRecordingId}
@@ -262,6 +290,7 @@ function TeacherControls({
   teacherIdentity,
   teacherAccessKey,
   participants,
+  microphoneRestrictions,
   isLocked,
   isRecording,
   activeRecordingId,
@@ -278,6 +307,7 @@ function TeacherControls({
   teacherIdentity: string
   teacherAccessKey: string
   participants: ApiParticipant[]
+  microphoneRestrictions: Record<string, MicrophoneRestriction>
   isLocked: boolean
   isRecording: boolean
   activeRecordingId: string | null
@@ -364,16 +394,29 @@ function TeacherControls({
     }
   }
 
-  const handleMuteStudent = async (studentIdentity: string) => {
+  const [muteMenuFor, setMuteMenuFor] = useState<string | null>(null)
+
+  const handleMuteStudent = async (studentIdentity: string, durationMinutes?: 1 | 5 | 10 | 15 | 30) => {
     try {
-      await api.muteParticipant({
+      await api.restrictStudentMicrophone({
         room_code: roomCode,
         teacher_identity: teacherIdentity,
         target_identity: studentIdentity,
+        duration_minutes: durationMinutes,
       })
+      setMuteMenuFor(null)
       onRefresh()
     } catch (err: any) {
       alert(err.message || 'Failed to mute student')
+    }
+  }
+
+  const handleUnmuteStudent = async (studentIdentity: string) => {
+    try {
+      await api.unrestrictStudentMicrophone({ room_code: roomCode, teacher_identity: teacherIdentity, target_identity: studentIdentity })
+      onRefresh()
+    } catch (err: any) {
+      alert(err.message || 'Failed to unmute student')
     }
   }
 
@@ -527,19 +570,24 @@ function TeacherControls({
                 </span>
               </div>
               {participant.role === 'student' && (
-                <div className="flex gap-2 mt-2">
-                  <button
-                    onClick={() => handleMuteStudent(participant.identity)}
-                    className="flex-1 sm:flex-none px-3 py-2 lg:px-2 lg:py-1 bg-gray-600 hover:bg-gray-500 text-white text-xs rounded transition-colors"
-                  >
-                    Mute
-                  </button>
+                <div className="mt-2">
+                  {microphoneRestrictions[participant.identity]?.restricted && <MicrophoneRestrictionLabel restriction={microphoneRestrictions[participant.identity]} />}
+                  <div className="flex gap-2 mt-2">
+                  {microphoneRestrictions[participant.identity]?.restricted ? (
+                    <button onClick={() => handleUnmuteStudent(participant.identity)} className="flex-1 sm:flex-none px-3 py-2 lg:px-2 lg:py-1 bg-green-600 hover:bg-green-700 text-white text-xs rounded transition-colors">Unmute</button>
+                  ) : (
+                    <div className="relative flex-1 sm:flex-none">
+                      <button onClick={() => setMuteMenuFor(muteMenuFor === participant.identity ? null : participant.identity)} className="w-full px-3 py-2 lg:px-2 lg:py-1 bg-gray-600 hover:bg-gray-500 text-white text-xs rounded transition-colors">Mute</button>
+                      {muteMenuFor === participant.identity && <MuteDurationMenu onSelect={(minutes) => handleMuteStudent(participant.identity, minutes)} />}
+                    </div>
+                  )}
                   <button
                     onClick={() => handleRemoveStudent(participant.identity)}
                     className="flex-1 sm:flex-none px-3 py-2 lg:px-2 lg:py-1 bg-red-600 hover:bg-red-700 text-white text-xs rounded transition-colors"
                   >
                     Remove
                   </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -556,6 +604,50 @@ function TeacherControls({
       </button>
     </div>
   )
+}
+
+function MuteDurationMenu({ onSelect }: { onSelect: (minutes?: 1 | 5 | 10 | 15 | 30) => void }) {
+  const options: Array<{ label: string; minutes?: 1 | 5 | 10 | 15 | 30 }> = [
+    { label: 'Mute for 1 minute', minutes: 1 }, { label: 'Mute for 5 minutes', minutes: 5 },
+    { label: 'Mute for 10 minutes', minutes: 10 }, { label: 'Mute for 15 minutes', minutes: 15 },
+    { label: 'Mute for 30 minutes', minutes: 30 }, { label: 'Mute until teacher unmutes' },
+  ]
+  return <div className="absolute z-20 left-0 bottom-full mb-1 w-52 rounded-lg bg-gray-900 border border-gray-600 shadow-xl overflow-hidden">
+    <div className="px-3 py-2 text-xs font-medium text-gray-300">Mute for</div>
+    {options.map(option => <button key={option.label} onClick={() => onSelect(option.minutes)} className="block w-full px-3 py-2 text-left text-xs text-white hover:bg-gray-700">{option.label}</button>)}
+  </div>
+}
+
+function MicrophoneRestrictionLabel({ restriction }: { restriction: MicrophoneRestriction }) {
+  const [, setTick] = useState(0)
+  useEffect(() => { const timer = window.setInterval(() => setTick(tick => tick + 1), 1000); return () => window.clearInterval(timer) }, [])
+  if (restriction.mode === 'UNTIL_TEACHER' || !restriction.expires_at) return <p className="text-xs text-yellow-300">🔒 Muted until teacher unmutes</p>
+  const remaining = remainingRestrictionSeconds(restriction)
+  return <p className="text-xs text-yellow-300">🔇 Muted · {formatRemaining(remaining)} remaining</p>
+}
+
+function MicrophoneRestrictionNotice({ restriction }: { restriction: MicrophoneRestriction }) {
+  const [, setTick] = useState(0)
+  useEffect(() => { const timer = window.setInterval(() => setTick(tick => tick + 1), 1000); return () => window.clearInterval(timer) }, [])
+  const untilTeacher = restriction.mode === 'UNTIL_TEACHER' || !restriction.expires_at
+  const remaining = untilTeacher ? 0 : remainingRestrictionSeconds(restriction)
+  return <div className="mx-3 mt-3 rounded-lg border border-yellow-700 bg-yellow-950 px-3 py-2 text-center text-sm text-yellow-100">
+    <div>{untilTeacher ? '🔒 Your microphone has been muted by the teacher.' : '🔇 Your microphone has been muted by the teacher.'}</div>
+    <div className="mt-1 text-xs text-yellow-200">{untilTeacher ? 'Your microphone will remain muted until the teacher unmutes you.' : `You can unmute after ${formatRemaining(remaining)}.`}</div>
+  </div>
+}
+
+function remainingRestrictionSeconds(restriction: MicrophoneRestriction) {
+  if (!restriction.expires_at) return 0
+  // expires_at is an offset-aware ISO-8601 UTC value from the backend. Date
+  // parses it as an absolute instant, avoiding local-timezone interpretation.
+  return Math.max(0, Math.ceil((new Date(restriction.expires_at).getTime() - Date.now()) / 1000))
+}
+
+function formatRemaining(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, '0')
+  const seconds = (totalSeconds % 60).toString().padStart(2, '0')
+  return `${minutes}:${seconds}`
 }
 
 function JoinRequests({ roomCode, teacherIdentity, teacherAccessKey }: { roomCode: string; teacherIdentity: string; teacherAccessKey: string }) {

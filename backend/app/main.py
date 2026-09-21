@@ -4,12 +4,15 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel as PydanticBase
 import secrets
 import asyncio
+import math
+from datetime import datetime, timezone
 
 from .config import settings
 from .models import (
     CreateRoomRequest, JoinRoomRequest, RoomResponse, CreateJoinRequest,
     JoinRequestTokenRequest, JoinRequestDecision,
     ModerationRequest, MuteAllRequest, SetPolicyRequest,
+    StudentMuteRestrictionRequest, StudentUnmuteRestrictionRequest,
     LockClassRequest, EndClassRequest,
     StartRecordingRequest, StopRecordingRequest,
     MicrophonePolicy, CameraPolicy,
@@ -174,6 +177,47 @@ def _serialize_join_request(request):
     }
 
 
+def _serialize_microphone_restriction(restriction):
+    server_time = datetime.now(timezone.utc)
+    if not restriction:
+        return {"restricted": False, "server_time": server_time.isoformat()}
+    expires_at = restriction["expires_at"]
+    return {
+        "restricted": True,
+        "mode": restriction["mode"],
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "updated_at": restriction["updated_at"].isoformat(),
+        "server_time": server_time.isoformat(),
+        "remaining_seconds": (
+            max(0, math.ceil((expires_at - server_time).total_seconds()))
+            if expires_at else None
+        ),
+    }
+
+
+async def _restore_microphone_after_expiry(room_code: str, student_identity: str,
+                                           expires_at: datetime):
+    """Release a timed restriction at its server-authoritative expiry time."""
+    await asyncio.sleep(max(0, (expires_at - datetime.now(timezone.utc)).total_seconds()))
+    if not session_state.expire_microphone_restriction(
+        room_code, student_identity, expected_expires_at=expires_at
+    ):
+        return  # The teacher released or replaced this restriction.
+    class_info = session_state.get_class(room_code)
+    if class_info and session_state.get_microphone_policy(room_code) != MicrophonePolicy.LOCKED:
+        # Restore permission only. The student's track stays muted until they
+        # explicitly choose Unmute in the client.
+        await livekit_service.set_microphone_publish_permission(
+            class_info["livekit_room_name"], student_identity, True)
+
+
+def _schedule_microphone_restriction_expiry(room_code: str, student_identity: str,
+                                            restriction) -> None:
+    if restriction["expires_at"]:
+        asyncio.create_task(_restore_microphone_after_expiry(
+            room_code, student_identity, restriction["expires_at"]))
+
+
 def _validate_join_request(request: CreateJoinRequest):
     if not request.student_name.strip():
         raise HTTPException(400, "Student name is required")
@@ -245,15 +289,28 @@ async def get_approved_join_token(request_id: str, request: JoinRequestTokenRequ
     participants = await livekit_service.get_participants(class_info["livekit_room_name"])
     if len(participants) >= class_info["max_participants"]:
         raise HTTPException(403, "Class is full. Maximum 50 participants reached.")
+    expired_restriction = session_state.expire_microphone_restriction(
+        room_code, join_request["student_identity"])
     mic_policy = session_state.get_microphone_policy(room_code)
+    if expired_restriction and mic_policy != MicrophonePolicy.LOCKED:
+        await livekit_service.set_microphone_publish_permission(
+            class_info["livekit_room_name"], join_request["student_identity"], True)
+    microphone_restricted = session_state.get_microphone_restriction(
+        room_code, join_request["student_identity"]) is not None
     camera_policy = session_state.get_camera_policy(room_code)
+    publish_sources = ["screen_share", "screen_share_audio"]
+    if not microphone_restricted and mic_policy != MicrophonePolicy.LOCKED:
+        publish_sources.append("microphone")
+    if camera_policy != CameraPolicy.LOCKED:
+        publish_sources.append("camera")
     token = livekit_service.create_access_token(
         identity=join_request["student_identity"], name=join_request["student_name"],
         room=class_info["livekit_room_name"], role="student",
-        can_publish=(mic_policy != MicrophonePolicy.LOCKED and camera_policy != CameraPolicy.LOCKED),
+        can_publish=True,
         can_subscribe=True, can_publish_data=True,
-        is_muted=(mic_policy in (MicrophonePolicy.MUTED_BY_DEFAULT, MicrophonePolicy.LOCKED)),
+        is_muted=(microphone_restricted or mic_policy in (MicrophonePolicy.MUTED_BY_DEFAULT, MicrophonePolicy.LOCKED)),
         is_camera_off=(camera_policy in (CameraPolicy.OFF_BY_DEFAULT, CameraPolicy.LOCKED)),
+        can_publish_sources=publish_sources,
     )
     return RoomResponse(room_code=room_code, room_name=class_info["class_name"], token=token, livekit_url=settings.LIVEKIT_URL)
 
@@ -317,7 +374,12 @@ async def get_participants(room_code: str):
     participants = await livekit_service.get_participants(c["livekit_room_name"])
     for p in participants:
         p["role"] = "teacher" if p["identity"] == c["teacher_identity"] else "student"
+    restrictions = {
+        identity: _serialize_microphone_restriction(restriction)
+        for identity, restriction in session_state.get_class_microphone_restrictions(room_code.upper()).items()
+    }
     return {"room_code": room_code, "participants": participants,
+            "microphone_restrictions": restrictions,
             "count": len(participants), "max_participants": c["max_participants"]}
 
 
@@ -375,6 +437,50 @@ async def mute_participant(request: ModerationRequest):
         raise HTTPException(400, "Target identity required")
     await livekit_service.mute_participant(c["livekit_room_name"], request.target_identity, True)
     return {"success": True, "message": "Participant muted"}
+
+
+@app.post("/api/teacher/restrict-student-microphone")
+async def restrict_student_microphone(request: StudentMuteRestrictionRequest):
+    c = _verify_teacher(request.room_code, request.teacher_identity)
+    if request.target_identity == c["teacher_identity"]:
+        raise HTTPException(400, "Cannot restrict the teacher microphone")
+    participants = await livekit_service.get_participants(c["livekit_room_name"])
+    if not any(p["identity"] == request.target_identity for p in participants):
+        raise HTTPException(404, "Student is not in this class")
+    restriction = session_state.set_microphone_restriction(
+        request.room_code.upper(), request.target_identity, request.duration_minutes)
+    _schedule_microphone_restriction_expiry(
+        request.room_code.upper(), request.target_identity, restriction)
+    await livekit_service.mute_participant(c["livekit_room_name"], request.target_identity, True)
+    await livekit_service.set_microphone_publish_permission(
+        c["livekit_room_name"], request.target_identity, False)
+    return _serialize_microphone_restriction(restriction)
+
+
+@app.post("/api/teacher/unrestrict-student-microphone")
+async def unrestrict_student_microphone(request: StudentUnmuteRestrictionRequest):
+    c = _verify_teacher(request.room_code, request.teacher_identity)
+    if request.target_identity == c["teacher_identity"]:
+        raise HTTPException(400, "Cannot change the teacher microphone")
+    session_state.clear_microphone_restriction(request.room_code.upper(), request.target_identity)
+    can_publish_microphone = session_state.get_microphone_policy(request.room_code.upper()) != MicrophonePolicy.LOCKED
+    if can_publish_microphone:
+        await livekit_service.set_microphone_publish_permission(
+            c["livekit_room_name"], request.target_identity, True)
+        await livekit_service.mute_participant(c["livekit_room_name"], request.target_identity, False)
+    return {"success": True, "message": "Student microphone restriction removed"}
+
+
+@app.get("/api/class/{room_code}/microphone-restriction/{student_identity}")
+async def get_student_microphone_restriction(room_code: str, student_identity: str):
+    c = session_state.get_class(room_code.upper())
+    if not c or not session_state.is_class_active(room_code.upper()):
+        raise HTTPException(404, "Class not found or has ended")
+    expired = session_state.expire_microphone_restriction(room_code.upper(), student_identity)
+    if expired and session_state.get_microphone_policy(room_code.upper()) != MicrophonePolicy.LOCKED:
+        await livekit_service.set_microphone_publish_permission(c["livekit_room_name"], student_identity, True)
+    return _serialize_microphone_restriction(
+        session_state.get_microphone_restriction(room_code.upper(), student_identity))
 
 
 @app.post("/api/teacher/set-microphone-policy")
