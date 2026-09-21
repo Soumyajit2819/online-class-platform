@@ -189,6 +189,7 @@ Railway will redeploy automatically.
 | `SUPABASE_S3_SECRET_KEY` | Supabase S3 secret key | ✅ |
 | `SUPABASE_S3_REGION` | Supabase S3 region | ✅ |
 | `SUPABASE_S3_BUCKET` | Storage bucket name | ✅ |
+| `RECORDING_PLAYBACK_SECRET` | Random secret for short-lived private HLS playback links | ✅ |
 | `ADMIN_DASHBOARD_PASSWORD` | Admin dashboard login password | ✅ |
 | `ENVIRONMENT` | Set to `production` | ✅ |
 

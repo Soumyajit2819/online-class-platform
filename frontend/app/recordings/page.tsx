@@ -1,7 +1,8 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import Link from 'next/link'
+import Hls from 'hls.js'
 import { api, Recording } from '@/lib/api'
 import PasscodeGate from '@/components/PasscodeGate'
 
@@ -32,11 +33,24 @@ function useCountdown(expiresAt: string) {
 // ---------------------------------------------------------------------------
 // Single recording card
 // ---------------------------------------------------------------------------
-function RecordingCard({ recording, onDownload }: {
-  recording: Recording
-  onDownload: (id: string) => void
-}) {
+function RecordingCard({ recording }: { recording: Recording }) {
   const countdown = useCountdown(recording.expires_at)
+  const videoRef = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !recording.playback_url) return
+    const source = api.recordingPlaybackUrl(recording.playback_url)
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = source
+      return () => { video.removeAttribute('src'); video.load() }
+    }
+    if (!Hls.isSupported()) return
+    const hls = new Hls()
+    hls.loadSource(source)
+    hls.attachMedia(video)
+    return () => hls.destroy()
+  }, [recording.playback_url])
 
   const barColor = countdown.urgent
     ? 'bg-red-500'
@@ -49,9 +63,6 @@ function RecordingCard({ recording, onDownload }: {
       year: 'numeric', month: 'short', day: 'numeric',
       hour: '2-digit', minute: '2-digit',
     })
-
-  const formatSize = (mb: number) =>
-    mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb} MB`
 
   return (
     <div className={`bg-white rounded-xl shadow-md hover:shadow-lg transition-shadow p-6 border-l-4 ${
@@ -68,32 +79,15 @@ function RecordingCard({ recording, onDownload }: {
           </p>
           <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500">
             <span>🗓 {formatDate(recording.started_at)}</span>
-            {recording.file_size_mb > 0 && (
-              <span>💾 {formatSize(recording.file_size_mb)}</span>
-            )}
+            <span className="capitalize">{recording.status === 'available' ? '▶ Ready to play' : '⏳ Finalizing recording'}</span>
           </div>
         </div>
 
-        {/* Download button */}
-        <div className="flex flex-col items-end gap-2 flex-shrink-0">
-          {!countdown.expired ? (
-            <button
-              onClick={() => onDownload(recording.recording_id)}
-              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Download MP4
-            </button>
-          ) : (
-            <span className="px-4 py-2 bg-gray-100 text-gray-500 rounded-lg text-sm">
-              Link Expired
-            </span>
-          )}
-        </div>
       </div>
+
+      {!countdown.expired && recording.playback_url && (
+        <video ref={videoRef} controls playsInline className="mt-4 w-full rounded-lg bg-black aspect-video" />
+      )}
 
       {/* Countdown bar */}
       {!countdown.expired && (
@@ -149,13 +143,6 @@ function RecordingsList() {
   const [recordings, setRecordings]   = useState<Recording[]>([])
   const [loading, setLoading]         = useState(true)
   const [error, setError]             = useState('')
-  const [downloading, setDownloading] = useState<string | null>(null)
-  const [toast, setToast]             = useState('')
-
-  const showToast = (msg: string) => {
-    setToast(msg)
-    setTimeout(() => setToast(''), 3000)
-  }
 
   const fetchRecordings = useCallback(async () => {
     setLoading(true)
@@ -181,46 +168,15 @@ function RecordingsList() {
     return () => clearInterval(id)
   }, [fetchRecordings])
 
-  const handleDownload = async (recordingId: string) => {
-    setDownloading(recordingId)
-    try {
-      const result = await api.getRecordingDownloadUrl(recordingId)
-      if (result.download_url) {
-        // Create hidden link and click it to trigger download
-        const a = document.createElement('a')
-        a.href     = result.download_url
-        a.download = `class-recording-${recordingId}.mp4`
-        a.target   = '_blank'
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-        showToast('Download started!')
-      } else {
-        showToast('Download URL not available. Try again shortly.')
-      }
-    } catch (err: any) {
-      showToast(err.message || 'Download failed')
-    } finally {
-      setDownloading(null)
-    }
-  }
-
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50 p-8">
-      {/* Toast notification */}
-      {toast && (
-        <div className="fixed top-4 right-4 z-50 bg-gray-900 text-white px-6 py-3 rounded-lg shadow-lg text-sm">
-          {toast}
-        </div>
-      )}
-
       <div className="max-w-4xl mx-auto">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-3xl font-bold text-gray-900">Class Recordings</h1>
             <p className="text-gray-500 mt-1">
-              Downloads available for <span className="font-semibold text-blue-600">20 hours</span> after recording ends
+              Recordings are available for <span className="font-semibold text-blue-600">20 hours</span>
             </p>
           </div>
           <div className="flex gap-3">
@@ -247,8 +203,8 @@ function RecordingsList() {
             <p className="font-semibold mb-1">About Recordings</p>
             <ul className="space-y-0.5 text-blue-700">
               <li>• Recordings are saved automatically when class ends</li>
-              <li>• Available to download for <strong>20 hours</strong> only</li>
-              <li>• Download the MP4 file to your device before the timer expires</li>
+              <li>• Available to play for <strong>20 hours</strong> only</li>
+              <li>• Playback continues seamlessly across HLS segments</li>
               <li>• After 20 hours the file is permanently deleted from our servers</li>
             </ul>
           </div>
@@ -286,7 +242,6 @@ function RecordingsList() {
               <RecordingCard
                 key={rec.recording_id}
                 recording={rec}
-                onDownload={handleDownload}
               />
             ))}
           </div>

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.livekit_service import session_state, livekit_service
+from app.config import settings
 
 
 # ---------------------------------------------------------------------------
@@ -17,6 +18,29 @@ from app.livekit_service import session_state, livekit_service
 
 async def get_client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+class TestRecordingPlaybackTokens:
+    def test_recording_access_token_is_signed_and_expires(self):
+        previous = settings.RECORDING_PLAYBACK_SECRET
+        settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
+        try:
+            token = livekit_service.create_recordings_access_token()
+            assert livekit_service.verify_recordings_access_token(token)
+            assert not livekit_service.verify_recordings_access_token(token + "tampered")
+        finally:
+            settings.RECORDING_PLAYBACK_SECRET = previous
+
+    def test_playback_token_is_scoped_to_one_recording(self):
+        previous = settings.RECORDING_PLAYBACK_SECRET
+        settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
+        try:
+            token = livekit_service.create_playback_token(
+                "rec_one", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+            assert livekit_service.verify_playback_token(token, "rec_one")
+            assert not livekit_service.verify_playback_token(token, "rec_other")
+        finally:
+            settings.RECORDING_PLAYBACK_SECRET = previous
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi.responses import Response
+from urllib.parse import quote
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel as PydanticBase
@@ -26,14 +28,13 @@ from .passcode_service import passcode_service
 # ---------------------------------------------------------------------------
 
 async def _cleanup_loop():
-    """Hourly: remove expired recording metadata + delete S3 files."""
+    """Hourly recording-level retention cleanup."""
     while True:
         await asyncio.sleep(3600)
         try:
-            expired = recording_state.cleanup_expired()
-            if expired:
-                print(f"✓ Cleaned {len(expired)} expired recording entries")
-            await livekit_service.delete_expired_recordings_from_storage()
+            removed = await livekit_service.cleanup_expired_recordings()
+            if removed:
+                print(f"✓ Cleaned {removed} expired recordings")
         except Exception as e:
             print(f"✗ Cleanup error: {e}")
 
@@ -564,37 +565,76 @@ async def stop_recording(request: StopRecordingRequest):
 
 
 # ---------------------------------------------------------------------------
-# Recordings — student dashboard (reads from Supabase S3)
+# Recordings — authenticated metadata and private HLS proxy
 # ---------------------------------------------------------------------------
 
+def _recordings_access_token(authorization: str | None) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Recordings access is required")
+    token = authorization[7:]
+    if not livekit_service.verify_recordings_access_token(token):
+        raise HTTPException(401, "Recordings access has expired")
+    return token
+
 @app.get("/api/recordings")
-async def get_all_recordings():
-    recordings = await livekit_service.list_recordings_from_storage()
+async def get_all_recordings(authorization: str | None = Header(default=None)):
+    _recordings_access_token(authorization)
+    recordings = await livekit_service.list_recordings()
+    for rec in recordings:
+        if rec["status"] == "available":
+            rec["playback_url"] = f"/api/recording/{rec['recording_id']}/hls/index.m3u8?token={livekit_service.create_playback_token(rec['recording_id'], rec['expires_at'])}"
     return {"recordings": recordings, "total": len(recordings)}
 
 
 @app.get("/api/recordings/{room_code}")
-async def get_recordings_by_room(room_code: str):
-    all_recs = await livekit_service.list_recordings_from_storage()
+async def get_recordings_by_room(room_code: str, authorization: str | None = Header(default=None)):
+    _recordings_access_token(authorization)
+    all_recs = await livekit_service.list_recordings()
     filtered = [r for r in all_recs if r["room_code"] == room_code.upper()]
     return {"recordings": filtered, "total": len(filtered), "room_code": room_code.upper()}
 
 
-@app.get("/api/recording/{recording_id}/download")
-async def get_download_url(recording_id: str):
-    all_recs = await livekit_service.list_recordings_from_storage()
-    rec = next((r for r in all_recs if r["recording_id"] == recording_id), None)
-    if not rec:
-        raise HTTPException(404, "Recording not found or has expired")
-    if not rec.get("download_url"):
-        raise HTTPException(400, "Download URL could not be generated")
-    return {
-        "recording_id": recording_id,
-        "download_url": rec["download_url"],
-        "expires_at":   rec["expires_at"],
-        "hours_left":   rec["hours_left"],
-        "file_size_mb": rec["file_size_mb"],
-    }
+@app.get("/api/recording/{recording_id}/hls/{object_name:path}")
+async def get_hls_object(recording_id: str, object_name: str, token: str):
+    if not livekit_service.verify_playback_token(token, recording_id):
+        raise HTTPException(403, "Playback link expired")
+    rec = await livekit_service.get_recording_metadata(recording_id)
+    if not rec or rec["status"] not in ("available", "processing"):
+        raise HTTPException(404, "Recording is not available")
+    if ".." in object_name.split("/") or not object_name:
+        raise HTTPException(400, "Invalid HLS object")
+    # Egress versions differ on whether playlist URIs are relative or include
+    # the configured prefix. Normalize both without ever allowing a cross-prefix
+    # read.
+    if object_name.startswith(rec["storage_prefix"]):
+        object_name = object_name[len(rec["storage_prefix"]):]
+    key = f"{rec['storage_prefix']}{object_name}"
+    try:
+        content = await livekit_service.get_object(key)
+    except Exception:
+        raise HTTPException(404, "HLS object not found")
+    if object_name.endswith(".m3u8"):
+        # Browser-native HLS cannot attach headers. Rewrite every media URI to
+        # this same short-lived, recording-scoped proxy URL.
+        text = content.decode("utf-8")
+        base = f"/api/recording/{recording_id}/hls/"
+        def proxy_uri(uri: str) -> str:
+            return f"{base}{quote(uri, safe='/')}?token={quote(token)}"
+
+        lines = []
+        for line in text.splitlines():
+            if line and not line.startswith("#"):
+                line = proxy_uri(line)
+            elif "URI=\"" in line:
+                # Covers EXT-X-MAP/init files and encryption-key files should
+                # the Egress configuration ever emit them.
+                import re
+                line = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{proxy_uri(m.group(1))}"', line)
+            lines.append(line)
+        return Response("\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "private, no-store"})
+    media_type = "video/mp2t" if object_name.endswith(".ts") else (
+        "video/iso.segment" if object_name.endswith((".m4s", ".mp4")) else "application/octet-stream")
+    return Response(content, media_type=media_type, headers={"Cache-Control": "private, no-store"})
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +670,9 @@ async def verify_recordings_passcode(request: PasscodeRequest):
     if not request.passcode or not request.passcode.strip():
         raise HTTPException(400, "Passcode is required")
     if passcode_service.verify_recordings_passcode(request.passcode):
-        return {"success": True, "message": "Access granted"}
+        # This gates metadata requests. Individual media objects are further
+        # protected by recording-scoped, short-lived HLS URLs.
+        return {"success": True, "message": "Access granted", "access_token": livekit_service.create_recordings_access_token()}
     raise HTTPException(403, "Invalid passcode")
 
 

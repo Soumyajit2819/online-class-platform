@@ -1,13 +1,19 @@
 import secrets
 import hashlib
 import asyncio
+import hmac
+import base64
+import json
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta, timezone
 import aiohttp
-from livekit.api import AccessToken, VideoGrants, S3Upload
+from livekit.api import AccessToken, VideoGrants
 from livekit.api.room_service import RoomService, CreateRoomRequest
 from livekit.api.egress_service import EgressService, RoomCompositeEgressRequest
-from livekit.api import EncodedFileOutput, EncodedFileType
+from livekit.api import (
+    SegmentedFileOutput, SegmentedFileProtocol, S3Upload, EncodingOptions,
+    AudioCodec, VideoCodec,
+)
 from .config import settings
 from .models import MicrophonePolicy, CameraPolicy
 
@@ -17,7 +23,7 @@ from .models import MicrophonePolicy, CameraPolicy
 # ---------------------------------------------------------------------------
 
 class RecordingState:
-    """In-memory metadata for active recordings (augments persistent S3 storage)."""
+    """Small cache for active sessions; Supabase is the recording source of truth."""
 
     def __init__(self):
         self.recordings: Dict[str, Dict[str, Any]] = {}       # recording_id -> info
@@ -25,8 +31,7 @@ class RecordingState:
 
     def add_recording(self, room_code: str, recording_id: str, egress_id: str,
                       livekit_room_name: str, class_name: str, teacher_name: str):
-        now    = datetime.utcnow()
-        expiry = now + timedelta(hours=20)
+        now = datetime.utcnow()
         self.recordings[recording_id] = {
             "recording_id":      recording_id,
             "egress_id":         egress_id,
@@ -37,7 +42,6 @@ class RecordingState:
             "status":            "recording",
             "started_at":        now,
             "ended_at":          None,
-            "expires_at":        expiry,
         }
         self.class_recordings.setdefault(room_code, []).append(recording_id)
 
@@ -50,19 +54,6 @@ class RecordingState:
             rec["status"] = status
             if ended_at:
                 rec["ended_at"] = ended_at
-
-    def cleanup_expired(self) -> List[str]:
-        now = datetime.utcnow()
-        expired = [rid for rid, r in self.recordings.items() if r["expires_at"] <= now]
-        for rid in expired:
-            room_code = self.recordings[rid]["room_code"]
-            del self.recordings[rid]
-            if room_code in self.class_recordings:
-                self.class_recordings[room_code] = [
-                    x for x in self.class_recordings[room_code] if x != rid
-                ]
-        return expired
-
 
 # ---------------------------------------------------------------------------
 # Session State
@@ -549,183 +540,195 @@ class LiveKitService:
 
     # ---- recording -------------------------------------------------------
 
+    def _recordings_table(self):
+        from supabase import create_client
+        return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY).table("recordings")
+
+    async def _recording_query(self, operation):
+        return await self._run_in_thread(operation)
+
+    async def _create_recording_metadata(self, record: Dict[str, Any]):
+        await self._recording_query(lambda: self._recordings_table().insert(record).execute())
+
+    async def _update_recording_metadata(self, recording_id: str, values: Dict[str, Any]):
+        await self._recording_query(lambda: self._recordings_table().update(values).eq("recording_id", recording_id).execute())
+
+    async def get_recording_metadata(self, recording_id: str) -> Optional[Dict[str, Any]]:
+        response = await self._recording_query(
+            lambda: self._recordings_table().select("*").eq("recording_id", recording_id).limit(1).execute())
+        return response.data[0] if response.data else None
+
+    def _s3_upload(self) -> S3Upload:
+        return S3Upload(access_key=self.s3_access_key, secret=self.s3_secret_key,
+                        region=self.s3_region, bucket=self.s3_bucket,
+                        endpoint=self.s3_endpoint, force_path_style=True)
+
     async def start_recording(self, room_code: str, livekit_room_name: str,
                                class_name: str, teacher_name: str) -> Dict[str, Any]:
-        """Start a LiveKit Egress recording → saves MP4 to Supabase Storage."""
+        """Start one continuous HLS egress; metadata is committed before Egress starts."""
+        recording_id = self.generate_recording_id()
+        prefix = f"recordings/{room_code}/{recording_id}/"
+        now = datetime.now(timezone.utc)
+        record = {
+            "recording_id": recording_id, "room_code": room_code,
+            "class_name": class_name, "teacher_name": teacher_name,
+            "storage_prefix": prefix, "playlist_key": f"{prefix}index.m3u8",
+            "egress_id": None, "started_at": now.isoformat(), "ended_at": None,
+            "expires_at": (now + timedelta(hours=20)).isoformat(), "status": "starting",
+        }
         try:
-            recording_id  = self.generate_recording_id()
-            egress_svc    = await self.get_egress_service()
-
-            s3_config = S3Upload(
-                access_key=self.s3_access_key,
-                secret=self.s3_secret_key,
-                region=self.s3_region,
-                bucket=self.s3_bucket,
-                endpoint=self.s3_endpoint,
-                force_path_style=True,
+            await self._create_recording_metadata(record)
+            output = SegmentedFileOutput(
+                protocol=SegmentedFileProtocol.HLS_PROTOCOL,
+                filename_prefix=f"{prefix}segment",
+                playlist_name=f"{prefix}index.m3u8",
+                live_playlist_name=f"{prefix}live.m3u8",
+                segment_duration=8,
+                s3=self._s3_upload(),
             )
-
-            output = EncodedFileOutput(
-                file_type=EncodedFileType.MP4,
-                filepath=f"recordings/{room_code}/{recording_id}.mp4",
-                s3=s3_config,
+            request = RoomCompositeEgressRequest(
+                room_name=livekit_room_name,
+                segment_outputs=[output],
+                advanced=EncodingOptions(width=640, height=360, framerate=24,
+                                         video_codec=VideoCodec.H264_MAIN,
+                                         video_bitrate=250, audio_codec=AudioCodec.AAC,
+                                         audio_bitrate=40, audio_frequency=48000,
+                                         key_frame_interval=8),
             )
-
-            req       = RoomCompositeEgressRequest(room_name=livekit_room_name, file=output)
-            egress    = await egress_svc.start_room_composite_egress(req)
-            egress_id = egress.egress_id
-
-            recording_state.add_recording(
-                room_code=room_code, recording_id=recording_id, egress_id=egress_id,
-                livekit_room_name=livekit_room_name, class_name=class_name, teacher_name=teacher_name)
+            egress = await (await self.get_egress_service()).start_room_composite_egress(request)
+            await self._update_recording_metadata(recording_id, {"egress_id": egress.egress_id, "status": "recording"})
+            recording_state.add_recording(room_code, recording_id, egress.egress_id,
+                                          livekit_room_name, class_name, teacher_name)
             session_state.set_recording(room_code, True, recording_id)
-
-            print(f"✓ Recording started: {recording_id} (egress: {egress_id})")
-            return {"success": True, "recording_id": recording_id, "egress_id": egress_id, "status": "recording"}
-
+            return {"success": True, "recording_id": recording_id, "egress_id": egress.egress_id, "status": "recording"}
         except Exception as e:
-            print(f"Error starting recording: {e}")
+            # No orphan row for an egress that never started.
+            try:
+                await self._recording_query(lambda: self._recordings_table().delete().eq("recording_id", recording_id).execute())
+            except Exception as cleanup_error:
+                print(f"Could not remove failed recording metadata: {cleanup_error}")
+            print(f"Error starting HLS recording: {e}")
             return {"success": False, "error": str(e)}
 
     async def stop_recording(self, room_code: str, recording_id: str) -> Dict[str, Any]:
-        """Stop the egress. File will finish uploading to Supabase automatically."""
         try:
-            rec = recording_state.get_recording(recording_id)
-            if not rec:
-                return {"success": False, "error": "Recording not found in session. If server restarted, the recording may still be in Supabase."}
-
+            record = await self.get_recording_metadata(recording_id)
+            if not record or record["room_code"] != room_code or not record.get("egress_id"):
+                return {"success": False, "error": "Recording not found"}
             from livekit.api.egress_service import StopEgressRequest
-            egress_svc = await self.get_egress_service()
-            await egress_svc.stop_egress(StopEgressRequest(egress_id=rec["egress_id"]))
-
-            recording_state.update_status(recording_id, "processing", ended_at=datetime.utcnow())
+            await (await self.get_egress_service()).stop_egress(StopEgressRequest(egress_id=record["egress_id"]))
+            ended = datetime.now(timezone.utc)
+            ended_at = ended.isoformat()
+            await self._update_recording_metadata(recording_id, {
+                "status": "processing", "ended_at": ended_at,
+                "expires_at": (ended + timedelta(hours=20)).isoformat(),
+            })
+            recording_state.update_status(recording_id, "processing", datetime.utcnow())
             session_state.set_recording(room_code, False, None)
-
-            print(f"✓ Recording stopped: {recording_id} — uploading to Supabase...")
             return {"success": True, "recording_id": recording_id, "status": "processing",
-                    "message": "Recording stopped. File is being saved to Supabase Storage."}
-
+                    "message": "Recording stopped; HLS playlist is being finalized."}
         except Exception as e:
             print(f"Error stopping recording: {e}")
             return {"success": False, "error": str(e)}
 
-    # ---- list recordings from Supabase S3 (persistent) ------------------
+    async def list_recordings(self) -> List[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        response = await self._recording_query(
+            lambda: self._recordings_table().select("*").gt("expires_at", now.isoformat()).neq("status", "failed").order("started_at", desc=True).execute())
+        recordings = []
+        for rec in response.data:
+            expires = datetime.fromisoformat(rec["expires_at"].replace("Z", "+00:00"))
+            if rec["status"] == "processing":
+                # The final playlist is the durable completion signal when no webhook is configured.
+                exists = await self.object_exists(rec["playlist_key"])
+                if exists:
+                    await self._update_recording_metadata(rec["recording_id"], {"status": "available"})
+                    rec["status"] = "available"
+                elif rec.get("ended_at"):
+                    ended = datetime.fromisoformat(rec["ended_at"].replace("Z", "+00:00"))
+                    # A stopped egress that has not produced a playlist after
+                    # finalization time is failed, not a perpetually stale row.
+                    if now - ended > timedelta(minutes=10):
+                        await self.delete_recording(rec)
+                        continue
+            rec["hours_left"] = max(0, int((expires - now).total_seconds() // 3600))
+            rec["playback_url"] = None
+            recordings.append(rec)
+        return recordings
 
-    async def list_recordings_from_storage(self) -> List[Dict[str, Any]]:
-        """
-        Fetch recordings directly from Supabase S3 bucket.
-        Works even after server restart — Supabase is the source of truth.
-        Returns recordings with pre-signed download URLs.
-        """
-        def _fetch():
+    async def object_exists(self, key: str) -> bool:
+        def _exists():
             try:
-                from botocore.exceptions import ClientError
+                self._s3_client().head_object(Bucket=self.s3_bucket, Key=key)
+                return True
+            except Exception:
+                return False
+        return await self._run_in_thread(_exists)
 
-                s3        = self._s3_client()
-                results   = []
-                paginator = s3.get_paginator('list_objects_v2')
+    async def get_object(self, key: str) -> bytes:
+        return await self._run_in_thread(lambda: self._s3_client().get_object(Bucket=self.s3_bucket, Key=key)["Body"].read())
 
-                for page in paginator.paginate(Bucket=self.s3_bucket, Prefix='recordings/'):
-                    for obj in page.get('Contents', []):
-                        key = obj['Key']          # recordings/ROOMCODE/rec_xxx.mp4
-                        if not key.endswith('.mp4'):
-                            continue
+    def create_playback_token(self, recording_id: str, expires_at: str) -> str:
+        """Short-lived, scoped bearer token for one recording's playlist and segments."""
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        expiry = min(int(expires.timestamp()), int((datetime.now(timezone.utc) + timedelta(hours=2)).timestamp()))
+        payload = base64.urlsafe_b64encode(json.dumps({"r": recording_id, "e": expiry}, separators=(",", ":")).encode()).decode().rstrip("=")
+        secret = (settings.RECORDING_PLAYBACK_SECRET or settings.SUPABASE_SERVICE_ROLE_KEY).encode()
+        signature = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+        return f"{payload}.{signature}"
 
-                        parts = key.split('/')
-                        if len(parts) < 3:
-                            continue
+    def create_recordings_access_token(self) -> str:
+        expiry = int((datetime.now(timezone.utc) + timedelta(hours=2)).timestamp())
+        payload = base64.urlsafe_b64encode(json.dumps({"scope": "recordings", "e": expiry}, separators=(",", ":")).encode()).decode().rstrip("=")
+        secret = (settings.RECORDING_PLAYBACK_SECRET or settings.SUPABASE_SERVICE_ROLE_KEY).encode()
+        return f"{payload}.{hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()}"
 
-                        room_code    = parts[1]
-                        recording_id = parts[2].replace('.mp4', '')
-                        last_modified = obj['LastModified']   # tz-aware
-                        file_size     = obj['Size']
+    def verify_recordings_access_token(self, token: str) -> bool:
+        try:
+            payload, signature = token.rsplit(".", 1)
+            secret = (settings.RECORDING_PLAYBACK_SECRET or settings.SUPABASE_SERVICE_ROLE_KEY).encode()
+            if not hmac.compare_digest(signature, hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()):
+                return False
+            decoded = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            return decoded["scope"] == "recordings" and int(decoded["e"]) > int(datetime.now(timezone.utc).timestamp())
+        except Exception:
+            return False
 
-                        expires_at  = last_modified + timedelta(hours=20)
-                        now_utc     = datetime.now(timezone.utc)
+    def verify_playback_token(self, token: str, recording_id: str) -> bool:
+        try:
+            payload, signature = token.rsplit(".", 1)
+            secret = (settings.RECORDING_PLAYBACK_SECRET or settings.SUPABASE_SERVICE_ROLE_KEY).encode()
+            expected = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                return False
+            decoded = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            return decoded["r"] == recording_id and int(decoded["e"]) > int(datetime.now(timezone.utc).timestamp())
+        except Exception:
+            return False
 
-                        if expires_at <= now_utc:
-                            continue   # expired — skip
+    async def cleanup_expired_recordings(self) -> int:
+        """Idempotently delete full expired prefixes, never an active recording."""
+        now = datetime.now(timezone.utc).isoformat()
+        response = await self._recording_query(
+            lambda: self._recordings_table().select("*").lte("expires_at", now).neq("status", "recording").neq("status", "starting").execute())
+        removed = 0
+        for rec in response.data:
+            await self.delete_recording(rec)
+            removed += 1
+        return removed
 
-                        hours_left     = int((expires_at - now_utc).total_seconds() // 3600)
-                        expiry_seconds = min(int((expires_at - now_utc).total_seconds()), 604800)
-
-                        # Generate pre-signed download URL
-                        try:
-                            download_url = s3.generate_presigned_url(
-                                'get_object',
-                                Params={'Bucket': self.s3_bucket, 'Key': key},
-                                ExpiresIn=expiry_seconds,
-                            )
-                        except Exception:
-                            download_url = None
-
-                        # Enrich with in-memory metadata if still available
-                        mem = recording_state.get_recording(recording_id)
-
-                        results.append({
-                            "recording_id": recording_id,
-                            "room_code":    room_code,
-                            "class_name":   mem["class_name"]   if mem else f"Class {room_code}",
-                            "teacher_name": mem["teacher_name"] if mem else "Unknown",
-                            "status":       "available",
-                            "started_at":   mem["started_at"].isoformat() if mem else last_modified.isoformat(),
-                            "ended_at":     mem["ended_at"].isoformat()   if (mem and mem.get("ended_at")) else last_modified.isoformat(),
-                            "expires_at":   expires_at.isoformat(),
-                            "hours_left":   hours_left,
-                            "file_size_mb": round(file_size / (1024 * 1024), 2),
-                            "download_url": download_url,
-                            "s3_key":       key,
-                        })
-
-                results.sort(key=lambda r: r["started_at"], reverse=True)
-                return results
-
-            except Exception as e:
-                print(f"Error listing recordings from Supabase: {e}")
-                return []
-
-        return await self._run_in_thread(_fetch)
-
-    async def delete_expired_recordings_from_storage(self):
-        """Delete files older than 3 days from Supabase S3 bucket."""
-        def _delete():
-            try:
-                from datetime import timezone
-                s3        = self._s3_client()
-                paginator = s3.get_paginator('list_objects_v2')
-                deleted   = []
-
-                for page in paginator.paginate(Bucket=self.s3_bucket, Prefix='recordings/'):
-                    for obj in page.get('Contents', []):
-                        key           = obj['Key']
-                        last_modified = obj['LastModified']  # tz-aware
-                        expires_at    = last_modified + timedelta(hours=20)
-                        now_utc       = datetime.now(timezone.utc)
-
-                        if expires_at <= now_utc:
-                            s3.delete_object(Bucket=self.s3_bucket, Key=key)
-                            deleted.append(key)
-                            print(f"✓ Deleted expired recording from Supabase: {key}")
-
-                return deleted
-            except Exception as e:
-                print(f"⚠ Error deleting expired recordings: {e}")
-                return []
-
-        return await self._run_in_thread(_delete)
-        """Generate a fresh pre-signed download URL."""
-        def _gen():
-            try:
-                s3 = self._s3_client()
-                return s3.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': self.s3_bucket, 'Key': s3_key},
-                    ExpiresIn=20 * 3600,
-                )
-            except Exception as e:
-                print(f"Error generating download URL: {e}")
-                return None
-        return await self._run_in_thread(_gen)
+    async def delete_recording(self, record: Dict[str, Any]):
+        """Delete all objects before metadata; safe when the prefix is already empty."""
+        prefix = record["storage_prefix"]
+        def _delete_prefix():
+            s3 = self._s3_client()
+            keys = []
+            for page in s3.get_paginator("list_objects_v2").paginate(Bucket=self.s3_bucket, Prefix=prefix):
+                keys.extend({"Key": item["Key"]} for item in page.get("Contents", []))
+            for offset in range(0, len(keys), 1000):
+                s3.delete_objects(Bucket=self.s3_bucket, Delete={"Objects": keys[offset:offset + 1000], "Quiet": True})
+        await self._run_in_thread(_delete_prefix)
+        await self._recording_query(lambda: self._recordings_table().delete().eq("recording_id", record["recording_id"]).execute())
 
 
 # ---------------------------------------------------------------------------

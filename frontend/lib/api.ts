@@ -1,4 +1,5 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+let recordingsAccessToken: string | null = null;
 
 export interface CreateRoomRequest {
   teacher_name: string;
@@ -106,7 +107,6 @@ export interface Recording {
   recording_id: string;
   egress_id: string;
   room_code: string;
-  livekit_room_name: string;
   class_name: string;
   teacher_name: string;
   status: string;
@@ -114,11 +114,7 @@ export interface Recording {
   ended_at: string | null;
   expires_at: string;
   hours_left: number;
-  duration_seconds: number;
-  download_url: string | null;
-  file_size: number;
-  file_size_mb: number;
-  s3_key: string;
+  playback_url: string | null;
 }
 
 class ApiError extends Error {
@@ -138,6 +134,9 @@ async function fetchApi<T>(
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      ...(endpoint.startsWith('/api/record') && recordingsAccessToken
+        ? { Authorization: `Bearer ${recordingsAccessToken}` }
+        : {}),
       ...options.headers,
     },
   });
@@ -279,10 +278,6 @@ export const api = {
     return fetchApi(`/api/recording/${recordingId}`);
   },
 
-  async getRecordingDownloadUrl(recordingId: string): Promise<{ recording_id: string; download_url: string; expires_at: string }> {
-    return fetchApi(`/api/recording/${recordingId}/download`);
-  },
-
   // Student endpoints
   async joinRoom(data: JoinRoomRequest): Promise<RoomResponse> {
     return fetchApi('/api/student/join-room', {
@@ -329,11 +324,17 @@ export const api = {
     });
   },
 
-  async verifyRecordingsPasscode(passcode: string): Promise<{ success: boolean; message: string }> {
-    return fetchApi('/api/auth/verify-recordings-passcode', {
+  async verifyRecordingsPasscode(passcode: string): Promise<{ success: boolean; message: string; access_token: string }> {
+    const result = await fetchApi<{ success: boolean; message: string; access_token: string }>('/api/auth/verify-recordings-passcode', {
       method: 'POST',
       body: JSON.stringify({ passcode }),
     });
+    recordingsAccessToken = result.access_token;
+    return result;
+  },
+
+  recordingPlaybackUrl(path: string): string {
+    return path.startsWith('http') ? path : `${API_URL}${path}`;
   },
 
   // Admin endpoints

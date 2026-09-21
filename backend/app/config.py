@@ -26,6 +26,11 @@ class Settings:
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     SUPABASE_ANON_KEY:         str = os.getenv("SUPABASE_ANON_KEY", "")
 
+    # HMAC key used only for short-lived recording playback URLs.  This must be
+    # independent of LiveKit and storage credentials so neither is ever sent to
+    # a browser.
+    RECORDING_PLAYBACK_SECRET: str = os.getenv("RECORDING_PLAYBACK_SECRET", "")
+
     # Admin dashboard password (set a strong value in production)
     ADMIN_DASHBOARD_PASSWORD: str = os.getenv("ADMIN_DASHBOARD_PASSWORD", "")
 
