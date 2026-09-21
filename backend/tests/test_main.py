@@ -2,12 +2,13 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 import sys
 import os
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from httpx import AsyncClient, ASGITransport
-from app.main import app, _safe_download_filename
+from app.main import app, _remux_hls_to_mp4, _safe_download_filename
 from app.livekit_service import session_state, livekit_service
 from app.config import settings
 
@@ -61,28 +62,87 @@ class TestRecordingDownload:
     @patch("app.main.shutil.which", return_value="/usr/bin/ffmpeg")
     @patch("app.main.livekit_service.object_exists", new_callable=AsyncMock, return_value=True)
     @patch("app.main.livekit_service.get_recording_metadata", new_callable=AsyncMock)
-    @patch("app.main._start_ffmpeg_remux", new_callable=AsyncMock, return_value=MagicMock())
-    async def test_authorized_download_streams_mp4(self, _start, get_recording, _object_exists, _ffmpeg):
-        async def fake_remux(_process):
-            yield b"fragmented-mp4-bytes"
+    @patch("app.main._remux_hls_to_mp4", new_callable=AsyncMock)
+    async def test_authorized_download_streams_mp4(self, remux, get_recording, _object_exists, _ffmpeg):
+        async def fake_remux(_playlist_url, output_path):
+            with open(output_path, "wb") as output:
+                output.write(b"finalized-mp4-bytes")
 
         get_recording.return_value = self._record()
         previous = settings.RECORDING_PLAYBACK_SECRET
         settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
         try:
             token = livekit_service.create_recordings_access_token()
-            with patch("app.main._stream_ffmpeg_mp4", fake_remux):
-                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                    response = await c.get(
-                        "/api/recordings/rec_download/download",
-                        headers={"Authorization": f"Bearer {token}"},
-                    )
+            remux.side_effect = fake_remux
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                response = await c.get(
+                    "/api/recordings/rec_download/download",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("video/mp4")
             assert response.headers["content-disposition"] == 'attachment; filename="Math-Grade-9-rec_download.mp4"'
-            assert response.content == b"fragmented-mp4-bytes"
+            assert response.content == b"finalized-mp4-bytes"
+            playlist_url = remux.await_args.args[0]
+            assert "/hls/index.m3u8?" in playlist_url
+            assert "live.m3u8" not in playlist_url
         finally:
             settings.RECORDING_PLAYBACK_SECRET = previous
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.get_object", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_recording_metadata", new_callable=AsyncMock)
+    async def test_hls_proxy_rewrites_and_serves_every_segment_as_media(self, get_recording, get_object):
+        record = self._record()
+        record["storage_prefix"] = "recordings/ROOM/rec_download/"
+        playlist = b"#EXTM3U\n#EXTINF:4.0,\nsegment0.ts\n#EXTINF:4.0,\nsegment1.ts\n#EXT-X-ENDLIST\n"
+        objects = {
+            record["playlist_key"]: playlist,
+            f"{record['storage_prefix']}segment0.ts": b"first-transport-stream",
+            f"{record['storage_prefix']}segment1.ts": b"second-transport-stream",
+        }
+        get_recording.return_value = record
+        get_object.side_effect = lambda key: objects[key]
+        previous = settings.RECORDING_PLAYBACK_SECRET
+        settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
+        try:
+            token = livekit_service.create_playback_token(record["recording_id"], record["expires_at"])
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.get(
+                    f"/api/recording/{record['recording_id']}/hls/index.m3u8?token={token}"
+                )
+                assert response.status_code == 200
+                segment_urls = [line for line in response.text.splitlines() if line.startswith("/api/")]
+                assert len(segment_urls) == 2
+                for segment_url, expected in zip(
+                    segment_urls,
+                    (b"first-transport-stream", b"second-transport-stream"),
+                ):
+                    segment = await client.get(urlsplit(segment_url).path + "?" + urlsplit(segment_url).query)
+                    assert segment.status_code == 200
+                    assert segment.headers["content-type"].startswith("video/mp2t")
+                    assert segment.content == expected
+        finally:
+            settings.RECORDING_PLAYBACK_SECRET = previous
+
+    @pytest.mark.asyncio
+    async def test_remux_finalizes_mp4_and_converts_adts_aac(self, tmp_path):
+        output_path = tmp_path / "recording.mp4"
+        process = MagicMock(returncode=0)
+
+        async def communicate():
+            output_path.write_bytes(b"finalized mp4")
+            return b"", b""
+
+        process.communicate.side_effect = communicate
+        with patch("app.main.asyncio.create_subprocess_exec", new_callable=AsyncMock) as create_process:
+            create_process.return_value = process
+            await _remux_hls_to_mp4("http://127.0.0.1/playlist.m3u8", str(output_path))
+
+        command = create_process.await_args.args
+        assert ("-bsf:a", "aac_adtstoasc") == command[command.index("-bsf:a"):command.index("-bsf:a") + 2]
+        assert ("-movflags", "+faststart") == command[command.index("-movflags"):command.index("-movflags") + 2]
+        assert "empty_moov" not in command
 
     @pytest.mark.asyncio
     @patch("app.main.shutil.which", return_value="/usr/bin/ffmpeg")

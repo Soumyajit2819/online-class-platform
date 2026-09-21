@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query, Header
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 from urllib.parse import quote
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 from datetime import datetime, timezone
 
 from .config import settings
@@ -585,41 +587,38 @@ def _safe_download_filename(record: dict) -> str:
     label = label.strip("._-")[:80] or "class-recording"
     return f"{label}-{record['recording_id']}.mp4"
 
-async def _start_ffmpeg_remux(playlist_url: str):
-    return await asyncio.create_subprocess_exec(
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+async def _remux_hls_to_mp4(playlist_url: str, output_path: str):
+    """Create a finalized MP4 from the private HLS proxy without retaining it."""
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-protocol_whitelist", "file,http,https,tcp,tls",
         "-i", playlist_url,
-        "-c", "copy", "-movflags", "frag_keyframe+empty_moov",
-        "-f", "mp4", "pipe:1",
+        # HLS transport streams carry AAC in ADTS framing; MP4 requires the
+        # AudioSpecificConfig form produced by this no-reencode filter.
+        "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart",
+        output_path,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        # Do not log playlist_url: it contains the server-only playback token.
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        print(f"FFmpeg HLS remux failed (exit {process.returncode}): {detail}")
+        raise RuntimeError("FFmpeg could not remux this recording")
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        print("FFmpeg HLS remux produced no MP4 data")
+        raise RuntimeError("FFmpeg could not remux this recording")
+    # stdout is intentionally captured as part of the process diagnostics. It
+    # should be empty because the finalized MP4 is written to output_path.
+    if stdout:
+        print(f"FFmpeg HLS remux produced unexpected stdout ({len(stdout)} bytes)")
 
-async def _stream_ffmpeg_mp4(process):
-    """Stream FFmpeg output and always tear down its child process."""
+def _delete_temporary_mp4(path: str):
     try:
-        while True:
-            try:
-                chunk = await asyncio.wait_for(process.stdout.read(64 * 1024), timeout=60)
-            except asyncio.TimeoutError:
-                raise RuntimeError("FFmpeg stopped producing download data")
-            if not chunk:
-                break
-            yield chunk
-        exit_code = await process.wait()
-        if exit_code != 0:
-            raise RuntimeError("FFmpeg could not remux this recording")
-    except (asyncio.CancelledError, GeneratorExit):
-        raise
-    finally:
-        if process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 @app.get("/api/recordings")
 async def get_all_recordings(authorization: str | None = Header(default=None)):
@@ -673,14 +672,18 @@ async def download_recording(recording_id: str, authorization: str | None = Head
         f"http://127.0.0.1:{port}/api/recording/{quote(recording_id, safe='')}/"
         f"hls/index.m3u8?token={quote(playback_token, safe='')}"
     )
+    file_descriptor, output_path = tempfile.mkstemp(prefix="recording-download-", suffix=".mp4")
+    os.close(file_descriptor)
     try:
-        process = await _start_ffmpeg_remux(playlist_url)
-    except (OSError, asyncio.SubprocessError) as exc:
-        print(f"Could not start FFmpeg download: {exc}")
+        await _remux_hls_to_mp4(playlist_url, output_path)
+    except (OSError, asyncio.SubprocessError, RuntimeError) as exc:
+        _delete_temporary_mp4(output_path)
+        print(f"Could not create MP4 download: {exc}")
         raise HTTPException(503, "Recording downloads are temporarily unavailable")
-    return StreamingResponse(
-        _stream_ffmpeg_mp4(process),
+    return FileResponse(
+        output_path,
         media_type="video/mp4",
+        background=BackgroundTask(_delete_temporary_mp4, output_path),
         headers={
             "Content-Disposition": f'attachment; filename="{_safe_download_filename(record)}"',
             "Cache-Control": "private, no-store",
