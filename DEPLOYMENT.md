@@ -83,7 +83,7 @@ Go to **Storage → S3 Configuration**:
 3. Select `online-class-platform`
 4. Set:
    - **Root Directory:** `backend`
-   - **Build Command:** `pip install -r requirements.txt`
+   - **Build Command:** `apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt`
    - **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
    - **Python Version:** 3.11
 5. Add all environment variables (see table below)

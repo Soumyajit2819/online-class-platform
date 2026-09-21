@@ -668,10 +668,10 @@ class LiveKitService:
     async def get_object(self, key: str) -> bytes:
         return await self._run_in_thread(lambda: self._s3_client().get_object(Bucket=self.s3_bucket, Key=key)["Body"].read())
 
-    def create_playback_token(self, recording_id: str, expires_at: str) -> str:
+    def create_playback_token(self, recording_id: str, expires_at: str, ttl_seconds: int = 2 * 3600) -> str:
         """Short-lived, scoped bearer token for one recording's playlist and segments."""
         expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-        expiry = min(int(expires.timestamp()), int((datetime.now(timezone.utc) + timedelta(hours=2)).timestamp()))
+        expiry = min(int(expires.timestamp()), int((datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).timestamp()))
         payload = base64.urlsafe_b64encode(json.dumps({"r": recording_id, "e": expiry}, separators=(",", ":")).encode()).decode().rstrip("=")
         secret = (settings.RECORDING_PLAYBACK_SECRET or settings.SUPABASE_SERVICE_ROLE_KEY).encode()
         signature = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()

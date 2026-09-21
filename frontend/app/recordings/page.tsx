@@ -33,7 +33,11 @@ function useCountdown(expiresAt: string) {
 // ---------------------------------------------------------------------------
 // Single recording card
 // ---------------------------------------------------------------------------
-function RecordingCard({ recording }: { recording: Recording }) {
+function RecordingCard({ recording, onDownload, downloading }: {
+  recording: Recording
+  onDownload: (recording: Recording) => void
+  downloading: boolean
+}) {
   const countdown = useCountdown(recording.expires_at)
   const videoRef = useRef<HTMLVideoElement>(null)
 
@@ -89,6 +93,18 @@ function RecordingCard({ recording }: { recording: Recording }) {
         <video ref={videoRef} controls playsInline className="mt-4 w-full rounded-lg bg-black aspect-video" />
       )}
 
+      {!countdown.expired && recording.status === 'available' && (
+        <div className="mt-4 flex justify-end">
+          <button
+            onClick={() => onDownload(recording)}
+            disabled={downloading}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-medium rounded-lg transition-colors text-sm"
+          >
+            {downloading ? 'Preparing download…' : 'Download MP4'}
+          </button>
+        </div>
+      )}
+
       {/* Countdown bar */}
       {!countdown.expired && (
         <div className="mt-4">
@@ -128,8 +144,7 @@ export default function RecordingsPage() {
         description="Enter the passcode to view and download class recordings"
         icon="📹"
         onVerify={async (passcode) => {
-          await api.verifyRecordingsPasscode(passcode)
-          return true
+          return api.verifyRecordingsPasscode(passcode)
         }}
         onSuccess={() => setUnlocked(true)}
       />
@@ -143,6 +158,8 @@ function RecordingsList() {
   const [recordings, setRecordings]   = useState<Recording[]>([])
   const [loading, setLoading]         = useState(true)
   const [error, setError]             = useState('')
+  const [downloading, setDownloading] = useState<string | null>(null)
+  const [downloadError, setDownloadError] = useState('')
 
   const fetchRecordings = useCallback(async () => {
     setLoading(true)
@@ -167,6 +184,27 @@ function RecordingsList() {
     const id = setInterval(fetchRecordings, 60000)
     return () => clearInterval(id)
   }, [fetchRecordings])
+
+  const handleDownload = async (recording: Recording) => {
+    if (downloading) return
+    setDownloading(recording.recording_id)
+    setDownloadError('')
+    try {
+      const { blob, filename } = await api.downloadRecording(recording.recording_id)
+      const href = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = href
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(href)
+    } catch (err: any) {
+      setDownloadError(err.message || 'Download failed. Please try again.')
+    } finally {
+      setDownloading(null)
+    }
+  }
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50 p-8">
@@ -210,6 +248,12 @@ function RecordingsList() {
           </div>
         </div>
 
+        {downloadError && (
+          <div className="mb-6 bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
+            {downloadError}
+          </div>
+        )}
+
         {/* Content */}
         {loading && recordings.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-24 text-gray-400">
@@ -242,6 +286,8 @@ function RecordingsList() {
               <RecordingCard
                 key={rec.recording_id}
                 recording={rec}
+                onDownload={handleDownload}
+                downloading={downloading === rec.recording_id}
               />
             ))}
           </div>

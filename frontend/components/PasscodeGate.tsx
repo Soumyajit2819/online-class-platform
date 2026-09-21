@@ -6,7 +6,7 @@ interface PasscodeGateProps {
   title: string
   description: string
   icon: string
-  onVerify: (passcode: string) => Promise<boolean>
+  onVerify: (passcode: string) => Promise<boolean | { success: boolean; access_token?: string }>
   onSuccess: () => void
 }
 
@@ -61,8 +61,14 @@ export default function PasscodeGate({
     setError('')
 
     try {
-      const ok = await onVerify(passcode)
+      const verification = await onVerify(passcode)
+      const ok = typeof verification === 'boolean' ? verification : verification.success
       if (ok) {
+        // Recording access uses the same existing password gate. Keep its
+        // short-lived server-issued token only for this browser tab.
+        if (typeof verification === 'object' && verification.access_token) {
+          sessionStorage.setItem('recordings_access_token', verification.access_token)
+        }
         onSuccess()
       } else {
         // Should not reach here — onVerify throws on failure

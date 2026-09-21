@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Header
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from urllib.parse import quote
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -7,6 +7,9 @@ from pydantic import BaseModel as PydanticBase
 import secrets
 import asyncio
 import math
+import os
+import re
+import shutil
 from datetime import datetime, timezone
 
 from .config import settings
@@ -576,14 +579,65 @@ def _recordings_access_token(authorization: str | None) -> str:
         raise HTTPException(401, "Recordings access has expired")
     return token
 
+def _safe_download_filename(record: dict) -> str:
+    """Build a browser-safe filename without leaking storage paths."""
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", record.get("class_name") or "class-recording")
+    label = label.strip("._-")[:80] or "class-recording"
+    return f"{label}-{record['recording_id']}.mp4"
+
+async def _start_ffmpeg_remux(playlist_url: str):
+    return await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-protocol_whitelist", "file,http,https,tcp,tls",
+        "-i", playlist_url,
+        "-c", "copy", "-movflags", "frag_keyframe+empty_moov",
+        "-f", "mp4", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+async def _stream_ffmpeg_mp4(process):
+    """Stream FFmpeg output and always tear down its child process."""
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(process.stdout.read(64 * 1024), timeout=60)
+            except asyncio.TimeoutError:
+                raise RuntimeError("FFmpeg stopped producing download data")
+            if not chunk:
+                break
+            yield chunk
+        exit_code = await process.wait()
+        if exit_code != 0:
+            raise RuntimeError("FFmpeg could not remux this recording")
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+
 @app.get("/api/recordings")
 async def get_all_recordings(authorization: str | None = Header(default=None)):
     _recordings_access_token(authorization)
     recordings = await livekit_service.list_recordings()
+    payload = []
     for rec in recordings:
+        # Do not disclose storage layout, Egress IDs, or other internal fields.
+        item = {key: rec.get(key) for key in (
+            "recording_id", "room_code", "class_name", "teacher_name", "status",
+            "started_at", "ended_at", "expires_at", "hours_left",
+        )}
         if rec["status"] == "available":
-            rec["playback_url"] = f"/api/recording/{rec['recording_id']}/hls/index.m3u8?token={livekit_service.create_playback_token(rec['recording_id'], rec['expires_at'])}"
-    return {"recordings": recordings, "total": len(recordings)}
+            item["playback_url"] = f"/api/recording/{rec['recording_id']}/hls/index.m3u8?token={livekit_service.create_playback_token(rec['recording_id'], rec['expires_at'])}"
+        else:
+            item["playback_url"] = None
+        payload.append(item)
+    return {"recordings": payload, "total": len(payload)}
 
 
 @app.get("/api/recordings/{room_code}")
@@ -592,6 +646,46 @@ async def get_recordings_by_room(room_code: str, authorization: str | None = Hea
     all_recs = await livekit_service.list_recordings()
     filtered = [r for r in all_recs if r["room_code"] == room_code.upper()]
     return {"recordings": filtered, "total": len(filtered), "room_code": room_code.upper()}
+
+
+@app.get("/api/recordings/{recording_id}/download")
+async def download_recording(recording_id: str, authorization: str | None = Header(default=None)):
+    """Authenticated, on-demand HLS-to-MP4 remux; output is never stored."""
+    _recordings_access_token(authorization)
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(503, "Recording downloads are temporarily unavailable")
+
+    record = await livekit_service.get_recording_metadata(recording_id)
+    if not record:
+        raise HTTPException(404, "Recording not found")
+    expires_at = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
+    if expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(410, "Recording has expired")
+    if record.get("status") != "available" or not await livekit_service.object_exists(record["playlist_key"]):
+        raise HTTPException(404, "Recording is not available")
+
+    # FFmpeg reads only from this service's loopback HLS proxy. The short-lived
+    # token is generated server-side and never sent to the browser or storage.
+    playback_token = livekit_service.create_playback_token(
+        recording_id, record["expires_at"], ttl_seconds=20 * 60)
+    port = os.getenv("PORT", "8080")
+    playlist_url = (
+        f"http://127.0.0.1:{port}/api/recording/{quote(recording_id, safe='')}/"
+        f"hls/index.m3u8?token={quote(playback_token, safe='')}"
+    )
+    try:
+        process = await _start_ffmpeg_remux(playlist_url)
+    except (OSError, asyncio.SubprocessError) as exc:
+        print(f"Could not start FFmpeg download: {exc}")
+        raise HTTPException(503, "Recording downloads are temporarily unavailable")
+    return StreamingResponse(
+        _stream_ffmpeg_mp4(process),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f'attachment; filename="{_safe_download_filename(record)}"',
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @app.get("/api/recording/{recording_id}/hls/{object_name:path}")

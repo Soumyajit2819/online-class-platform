@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from httpx import AsyncClient, ASGITransport
-from app.main import app
+from app.main import app, _safe_download_filename
 from app.livekit_service import session_state, livekit_service
 from app.config import settings
 
@@ -30,6 +30,96 @@ class TestRecordingPlaybackTokens:
             assert not livekit_service.verify_recordings_access_token(token + "tampered")
         finally:
             settings.RECORDING_PLAYBACK_SECRET = previous
+
+
+class TestRecordingDownload:
+    @staticmethod
+    def _record(expires_at=None):
+        return {
+            "recording_id": "rec_download", "class_name": "Math / Grade 9",
+            "playlist_key": "recordings/ROOM/rec_download/index.m3u8",
+            "expires_at": expires_at or (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            "status": "available",
+        }
+
+    @pytest.mark.asyncio
+    async def test_download_requires_recordings_access_token(self):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            response = await c.get("/api/recordings/rec_download/download")
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_invalid_recordings_access_token(self):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            response = await c.get(
+                "/api/recordings/rec_download/download",
+                headers={"Authorization": "Bearer invalid-token"},
+            )
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    @patch("app.main.shutil.which", return_value="/usr/bin/ffmpeg")
+    @patch("app.main.livekit_service.object_exists", new_callable=AsyncMock, return_value=True)
+    @patch("app.main.livekit_service.get_recording_metadata", new_callable=AsyncMock)
+    @patch("app.main._start_ffmpeg_remux", new_callable=AsyncMock, return_value=MagicMock())
+    async def test_authorized_download_streams_mp4(self, _start, get_recording, _object_exists, _ffmpeg):
+        async def fake_remux(_process):
+            yield b"fragmented-mp4-bytes"
+
+        get_recording.return_value = self._record()
+        previous = settings.RECORDING_PLAYBACK_SECRET
+        settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
+        try:
+            token = livekit_service.create_recordings_access_token()
+            with patch("app.main._stream_ffmpeg_mp4", fake_remux):
+                async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                    response = await c.get(
+                        "/api/recordings/rec_download/download",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("video/mp4")
+            assert response.headers["content-disposition"] == 'attachment; filename="Math-Grade-9-rec_download.mp4"'
+            assert response.content == b"fragmented-mp4-bytes"
+        finally:
+            settings.RECORDING_PLAYBACK_SECRET = previous
+
+    @pytest.mark.asyncio
+    @patch("app.main.shutil.which", return_value="/usr/bin/ffmpeg")
+    @patch("app.main.livekit_service.get_recording_metadata", new_callable=AsyncMock)
+    async def test_download_missing_recording_returns_404(self, get_recording, _ffmpeg):
+        get_recording.return_value = None
+        previous = settings.RECORDING_PLAYBACK_SECRET
+        settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
+        try:
+            token = livekit_service.create_recordings_access_token()
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                response = await c.get("/api/recordings/nope/download", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 404
+        finally:
+            settings.RECORDING_PLAYBACK_SECRET = previous
+
+    @pytest.mark.asyncio
+    @patch("app.main.shutil.which", return_value="/usr/bin/ffmpeg")
+    @patch("app.main.livekit_service.object_exists", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_recording_metadata", new_callable=AsyncMock)
+    async def test_download_expired_recording_returns_410(self, get_recording, object_exists, _ffmpeg):
+        get_recording.return_value = self._record(datetime.now(timezone.utc).isoformat())
+        object_exists.return_value = True
+        previous = settings.RECORDING_PLAYBACK_SECRET
+        settings.RECORDING_PLAYBACK_SECRET = "test-recording-secret"
+        try:
+            token = livekit_service.create_recordings_access_token()
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                response = await c.get("/api/recordings/rec_download/download", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 410
+        finally:
+            settings.RECORDING_PLAYBACK_SECRET = previous
+
+    def test_download_filename_is_sanitized(self):
+        filename = _safe_download_filename({"class_name": "../../bad:name?", "recording_id": "rec_123"})
+        assert filename == "bad-name-rec_123.mp4"
+        assert "/" not in filename and ".." not in filename
 
     def test_playback_token_is_scoped_to_one_recording(self):
         previous = settings.RECORDING_PLAYBACK_SECRET

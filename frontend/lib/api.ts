@@ -1,5 +1,9 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-let recordingsAccessToken: string | null = null;
+function recordingsAccessToken(): string | null {
+  return typeof window === 'undefined'
+    ? null
+    : sessionStorage.getItem('recordings_access_token');
+}
 
 export interface CreateRoomRequest {
   teacher_name: string;
@@ -134,8 +138,8 @@ async function fetchApi<T>(
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...(endpoint.startsWith('/api/record') && recordingsAccessToken
-        ? { Authorization: `Bearer ${recordingsAccessToken}` }
+      ...(endpoint.startsWith('/api/record') && recordingsAccessToken()
+        ? { Authorization: `Bearer ${recordingsAccessToken()}` }
         : {}),
       ...options.headers,
     },
@@ -274,6 +278,21 @@ export const api = {
     return fetchApi('/api/recordings');
   },
 
+  async downloadRecording(recordingId: string): Promise<{ blob: Blob; filename: string }> {
+    const token = recordingsAccessToken()
+    const response = await fetch(`${API_URL}/api/recordings/${encodeURIComponent(recordingId)}/download`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!response.ok) {
+      let message = 'Download failed'
+      try { message = (await response.json()).detail || message } catch { message = response.statusText || message }
+      throw new ApiError(response.status, message)
+    }
+    const disposition = response.headers.get('Content-Disposition') || ''
+    const match = disposition.match(/filename="?([^";]+)"?/i)
+    return { blob: await response.blob(), filename: match?.[1] || `class-recording-${recordingId}.mp4` }
+  },
+
   async getRecordingStatus(recordingId: string): Promise<{ success: boolean; recording: Recording }> {
     return fetchApi(`/api/recording/${recordingId}`);
   },
@@ -329,7 +348,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ passcode }),
     });
-    recordingsAccessToken = result.access_token;
     return result;
   },
 
