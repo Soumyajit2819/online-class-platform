@@ -15,7 +15,7 @@ import {
 } from '@livekit/components-react'
 import '@livekit/components-styles'
 import { Track, RoomEvent, Participant, Room } from 'livekit-client'
-import { api, Participant as ApiParticipant } from '@/lib/api'
+import { api, Participant as ApiParticipant, JoinRequest } from '@/lib/api'
 
 interface VideoConferenceProps {
   token: string
@@ -23,6 +23,7 @@ interface VideoConferenceProps {
   roomCode: string
   roomName: string
   isTeacher: boolean
+  teacherAccessKey: string
 }
 
 export default function VideoConferenceComponent({
@@ -31,6 +32,7 @@ export default function VideoConferenceComponent({
   roomCode,
   roomName,
   isTeacher,
+  teacherAccessKey,
 }: VideoConferenceProps) {
   const [error, setError] = useState<string | null>(null)
 
@@ -51,6 +53,7 @@ export default function VideoConferenceComponent({
         roomCode={roomCode}
         roomName={roomName}
         isTeacher={isTeacher}
+        teacherAccessKey={teacherAccessKey}
       />
     </LiveKitRoom>
   )
@@ -60,10 +63,12 @@ function ClassroomContent({
   roomCode,
   roomName,
   isTeacher,
+  teacherAccessKey,
 }: {
   roomCode: string
   roomName: string
   isTeacher: boolean
+  teacherAccessKey: string
 }) {
   const room = useRoomContext()
   const participants = useParticipants()
@@ -221,6 +226,7 @@ function ClassroomContent({
           <TeacherControls
             roomCode={roomCode}
             teacherIdentity={teacherIdentity}
+            teacherAccessKey={teacherAccessKey}
             participants={participantsList}
             isLocked={isLocked}
             isRecording={isRecording}
@@ -254,6 +260,7 @@ function ClassroomContent({
 function TeacherControls({
   roomCode,
   teacherIdentity,
+  teacherAccessKey,
   participants,
   isLocked,
   isRecording,
@@ -269,6 +276,7 @@ function TeacherControls({
 }: {
   roomCode: string
   teacherIdentity: string
+  teacherAccessKey: string
   participants: ApiParticipant[]
   isLocked: boolean
   isRecording: boolean
@@ -498,6 +506,8 @@ function TeacherControls({
       </div>
 
       {/* Participants */}
+      <JoinRequests roomCode={roomCode} teacherIdentity={teacherIdentity} teacherAccessKey={teacherAccessKey} />
+
       <div className="mb-6">
         <h3 className="text-sm font-medium text-gray-300 mb-2">
           👥 Participants ({participants.length}/50)
@@ -544,6 +554,57 @@ function TeacherControls({
       >
         🛑 End Class
       </button>
+    </div>
+  )
+}
+
+function JoinRequests({ roomCode, teacherIdentity, teacherAccessKey }: { roomCode: string; teacherIdentity: string; teacherAccessKey: string }) {
+  const [requests, setRequests] = useState<JoinRequest[]>([])
+  const [error, setError] = useState('')
+  const [handling, setHandling] = useState<string | null>(null)
+
+  const refresh = useCallback(async () => {
+    if (!teacherIdentity) return
+    try {
+      const response = await api.getWaitingJoinRequests(roomCode, teacherIdentity)
+      setRequests(response.requests)
+      setError('')
+    } catch {
+      setError('Unable to load join requests. Retrying...')
+    }
+  }, [roomCode, teacherIdentity])
+
+  useEffect(() => {
+    refresh()
+    const timer = window.setInterval(refresh, 2500)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+
+  const decide = async (requestId: string, allowed: boolean) => {
+    setHandling(requestId)
+    try {
+      const data = { room_code: roomCode, teacher_identity: teacherIdentity, teacher_access_key: teacherAccessKey, request_id: requestId }
+      if (allowed) await api.approveJoinRequest(data)
+      else await api.rejectJoinRequest(data)
+      await refresh()
+    } catch {
+      setError(`Unable to ${allowed ? 'approve' : 'reject'} this student. Please try again.`)
+    } finally { setHandling(null) }
+  }
+
+  return (
+    <div className="mb-6">
+      <h3 className="text-sm font-medium text-gray-300 mb-2">🚪 Join Requests ({requests.length})</h3>
+      {error && <p className="mb-2 text-xs text-amber-300">{error}</p>}
+      {requests.length === 0 ? <p className="text-sm text-gray-400">No students are waiting.</p> : (
+        <div className="space-y-2">
+          {requests.map(request => <div key={request.request_id} className="p-3 bg-gray-700 rounded-lg">
+            <div className="text-white font-medium break-words">{request.student_name}</div>
+            <div className="text-xs text-gray-400 mb-2">Waiting…</div>
+            <div className="flex gap-2"><button disabled={handling === request.request_id} onClick={() => decide(request.request_id, true)} className="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 disabled:bg-green-800 text-white text-xs rounded">Allow</button><button disabled={handling === request.request_id} onClick={() => decide(request.request_id, false)} className="flex-1 px-3 py-2 bg-red-600 hover:bg-red-700 disabled:bg-red-800 text-white text-xs rounded">Reject</button></div>
+          </div>)}
+        </div>
+      )}
     </div>
   )
 }

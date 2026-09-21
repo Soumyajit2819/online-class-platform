@@ -20,6 +20,7 @@ export default function ClassroomPage({
   const [livekitUrl, setLivekitUrl] = useState<string | null>(null)
   const [roomName, setRoomName] = useState<string>('')
   const [isTeacher, setIsTeacher] = useState(false)
+  const [teacherAccessKey, setTeacherAccessKey] = useState('')
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -38,6 +39,7 @@ export default function ClassroomPage({
     setLivekitUrl(storedUrl)
     setRoomName(storedRoomName || 'Class')
     setIsTeacher(storedIsTeacher === 'true')
+    setTeacherAccessKey(sessionStorage.getItem('teacher_access_key') || '')
   }, [])
 
   if (error) {
@@ -72,6 +74,7 @@ export default function ClassroomPage({
       roomCode={params.roomCode}
       roomName={roomName}
       isTeacher={isTeacher}
+      teacherAccessKey={teacherAccessKey}
     />
   )
 }

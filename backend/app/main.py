@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel as PydanticBase
@@ -7,7 +7,8 @@ import asyncio
 
 from .config import settings
 from .models import (
-    CreateRoomRequest, JoinRoomRequest, RoomResponse,
+    CreateRoomRequest, JoinRoomRequest, RoomResponse, CreateJoinRequest,
+    JoinRequestTokenRequest, JoinRequestDecision,
     ModerationRequest, MuteAllRequest, SetPolicyRequest,
     LockClassRequest, EndClassRequest,
     StartRecordingRequest, StopRecordingRequest,
@@ -120,6 +121,8 @@ async def create_room(request: CreateRoomRequest):
         raise HTTPException(400, "Max participants must be between 2 and 50")
 
     room_code        = livekit_service.generate_room_code()
+    invite_code      = secrets.token_urlsafe(16)
+    teacher_access_key = secrets.token_urlsafe(32)
     livekit_room     = livekit_service.generate_livekit_room_name()
     teacher_identity = f"teacher_{secrets.token_urlsafe(8)}"
     passcode_hash    = livekit_service.hash_passcode(request.meeting_passcode)
@@ -136,6 +139,8 @@ async def create_room(request: CreateRoomRequest):
         max_participants=request.max_participants,
         student_microphone_policy=request.student_microphone_policy,
         student_camera_policy=request.student_camera_policy,
+        invite_code=invite_code,
+        teacher_access_key=teacher_access_key,
     )
 
     token = livekit_service.create_access_token(
@@ -144,8 +149,9 @@ async def create_room(request: CreateRoomRequest):
         can_publish=True, can_subscribe=True, can_publish_data=True,
     )
 
-    return RoomResponse(room_code=room_code, room_name=request.room_name,
-                        token=token, livekit_url=settings.LIVEKIT_URL)
+    return {"room_code": room_code, "room_name": request.room_name,
+            "token": token, "livekit_url": settings.LIVEKIT_URL,
+            "invite_code": invite_code, "teacher_access_key": teacher_access_key}
 
 
 # ---------------------------------------------------------------------------
@@ -154,49 +160,131 @@ async def create_room(request: CreateRoomRequest):
 
 @app.post("/api/student/join-room", response_model=RoomResponse)
 async def join_room(request: JoinRoomRequest):
+    """Legacy endpoint deliberately cannot issue student tokens without approval."""
+    raise HTTPException(403, "Join approval is required. Submit a join request first.")
+
+
+def _serialize_join_request(request):
+    return {
+        "request_id": request["request_id"], "room_code": request["room_code"],
+        "student_name": request["student_name"], "status": request["status"],
+        "created_at": request["created_at"].isoformat(),
+        "updated_at": request["updated_at"].isoformat(),
+        "decided_at": request["decided_at"].isoformat() if request["decided_at"] else None,
+    }
+
+
+def _validate_join_request(request: CreateJoinRequest):
     if not request.student_name.strip():
         raise HTTPException(400, "Student name is required")
-    if not request.room_code.strip():
-        raise HTTPException(400, "Room code is required")
     if not request.meeting_passcode.strip():
         raise HTTPException(400, "Meeting passcode is required")
-
-    rc = request.room_code.upper()
-
-    if not session_state.is_class_active(rc):
+    if not request.session_id.strip() or len(request.session_id) < 16:
+        raise HTTPException(400, "Invalid join session")
+    room_code = request.room_code.upper().strip() if request.room_code else None
+    if request.invite_code:
+        invited_room = session_state.get_room_code_for_invite(request.invite_code)
+        if not invited_room:
+            raise HTTPException(404, "This class link is invalid or no longer available")
+        if room_code and room_code != invited_room:
+            raise HTTPException(400, "Invite link does not match the room code")
+        room_code = invited_room
+    if not room_code:
+        raise HTTPException(400, "Room code or invite link is required")
+    if not session_state.is_class_active(room_code):
         raise HTTPException(404, "Class not found or has ended")
-    if session_state.is_class_locked(rc):
+    if session_state.is_class_locked(room_code):
         raise HTTPException(403, "Class is locked. New students cannot join.")
-    if not session_state.verify_passcode(rc, request.meeting_passcode):
-        raise HTTPException(403, "Invalid meeting passcode")
+    if not session_state.verify_passcode(room_code, request.meeting_passcode):
+        raise HTTPException(403, "Incorrect meeting passcode")
+    return room_code
 
-    class_info = session_state.get_class(rc)
-    if not class_info:
-        raise HTTPException(404, "Class not found")
 
-    student_identity = f"student_{secrets.token_urlsafe(8)}"
+@app.get("/api/join/{invite_code}")
+async def get_invite_info(invite_code: str):
+    room_code = session_state.get_room_code_for_invite(invite_code)
+    if not room_code or not session_state.is_class_active(room_code):
+        raise HTTPException(404, "This class link is invalid or no longer available")
+    c = session_state.get_class(room_code)
+    return {"room_code": room_code, "class_name": c["class_name"], "teacher_name": c["teacher_name"]}
 
-    if session_state.is_participant_blocked(rc, student_identity):
+
+@app.post("/api/student/join-requests")
+async def create_join_request(request: CreateJoinRequest):
+    room_code = _validate_join_request(request)
+    existing = session_state.get_join_request_for_session(room_code, request.session_id)
+    if existing and existing["status"] == "REJECTED":
+        raise HTTPException(403, "Your request to join this class was declined.")
+    join_request = session_state.create_join_request(room_code, request.student_name, request.session_id)
+    return _serialize_join_request(join_request)
+
+
+@app.get("/api/student/join-requests/{request_id}")
+async def get_join_request_status(request_id: str, session_id: str = Query(...)):
+    request = session_state.get_join_request(request_id)
+    if not request or not secrets.compare_digest(request["session_id"], session_id):
+        raise HTTPException(404, "Join request not found")
+    if not session_state.is_class_active(request["room_code"]):
+        raise HTTPException(410, "This class has ended")
+    return _serialize_join_request(request)
+
+
+@app.post("/api/student/join-requests/{request_id}/token", response_model=RoomResponse)
+async def get_approved_join_token(request_id: str, request: JoinRequestTokenRequest):
+    join_request = session_state.get_join_request(request_id)
+    if not join_request or not secrets.compare_digest(join_request["session_id"], request.session_id):
+        raise HTTPException(404, "Join request not found")
+    if join_request["status"] != "APPROVED":
+        raise HTTPException(403, "Teacher approval is required before joining")
+    room_code = join_request["room_code"]
+    if not session_state.is_class_active(room_code):
+        raise HTTPException(410, "This class has ended")
+    if session_state.is_participant_blocked(room_code, join_request["student_identity"]):
         raise HTTPException(403, "You have been removed from this class")
-
+    class_info = session_state.get_class(room_code)
     participants = await livekit_service.get_participants(class_info["livekit_room_name"])
     if len(participants) >= class_info["max_participants"]:
         raise HTTPException(403, "Class is full. Maximum 50 participants reached.")
-
-    mic_policy    = session_state.get_microphone_policy(rc)
-    camera_policy = session_state.get_camera_policy(rc)
-
+    mic_policy = session_state.get_microphone_policy(room_code)
+    camera_policy = session_state.get_camera_policy(room_code)
     token = livekit_service.create_access_token(
-        identity=student_identity, name=request.student_name,
+        identity=join_request["student_identity"], name=join_request["student_name"],
         room=class_info["livekit_room_name"], role="student",
         can_publish=(mic_policy != MicrophonePolicy.LOCKED and camera_policy != CameraPolicy.LOCKED),
         can_subscribe=True, can_publish_data=True,
         is_muted=(mic_policy in (MicrophonePolicy.MUTED_BY_DEFAULT, MicrophonePolicy.LOCKED)),
         is_camera_off=(camera_policy in (CameraPolicy.OFF_BY_DEFAULT, CameraPolicy.LOCKED)),
     )
+    return RoomResponse(room_code=room_code, room_name=class_info["class_name"], token=token, livekit_url=settings.LIVEKIT_URL)
 
-    return RoomResponse(room_code=rc, room_name=class_info["class_name"],
-                        token=token, livekit_url=settings.LIVEKIT_URL)
+
+@app.get("/api/teacher/{room_code}/join-requests")
+async def get_waiting_join_requests(room_code: str, teacher_identity: str = Query(...)):
+    _verify_teacher(room_code, teacher_identity)
+    return {"requests": [_serialize_join_request(r) for r in session_state.get_waiting_join_requests(room_code.upper())]}
+
+
+async def _decide_join_request(request: JoinRequestDecision, status: str):
+    class_info = _verify_teacher(request.room_code, request.teacher_identity)
+    if not secrets.compare_digest(class_info["teacher_access_key"], request.teacher_access_key):
+        raise HTTPException(403, "Only the authorized teacher can handle join requests")
+    join_request = session_state.get_join_request(request.request_id)
+    if not join_request or join_request["room_code"] != request.room_code.upper():
+        raise HTTPException(404, "Join request not found")
+    updated = session_state.decide_join_request(request.request_id, status)
+    if not updated:
+        raise HTTPException(409, "This join request has already been handled")
+    return _serialize_join_request(updated)
+
+
+@app.post("/api/teacher/approve-join-request")
+async def approve_join_request(request: JoinRequestDecision):
+    return await _decide_join_request(request, "APPROVED")
+
+
+@app.post("/api/teacher/reject-join-request")
+async def reject_join_request(request: JoinRequestDecision):
+    return await _decide_join_request(request, "REJECTED")
 
 
 # ---------------------------------------------------------------------------

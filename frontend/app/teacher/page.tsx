@@ -38,7 +38,7 @@ function TeacherForm() {
   const [loading, setLoading]                 = useState(false)
   const [error, setError]                     = useState('')
   const [createdRoom, setCreatedRoom]         = useState<{
-    room_code: string; room_name: string; token: string; livekit_url: string
+    room_code: string; room_name: string; token: string; livekit_url: string; invite_code?: string; teacher_access_key?: string
   } | null>(null)
   const [showPasscode, setShowPasscode] = useState(false)
 
@@ -70,47 +70,56 @@ function TeacherForm() {
     sessionStorage.setItem('room_code', createdRoom.room_code)
     sessionStorage.setItem('room_name', createdRoom.room_name)
     sessionStorage.setItem('is_teacher', 'true')
+    if (createdRoom.teacher_access_key) sessionStorage.setItem('teacher_access_key', createdRoom.teacher_access_key)
     router.push(`/class/${createdRoom.room_code}`)
   }
 
   const handleCopyDetails = () => {
     if (!createdRoom) return
-    const text = `Class: ${createdRoom.room_name}\nRoom Code: ${createdRoom.room_code}\nMeeting Passcode: ${meetingPasscode}`
-    navigator.clipboard.writeText(text)
-    alert('Class details copied!')
+    const inviteUrl = `${window.location.origin}/join/${createdRoom.invite_code}`
+    const text = `Class: ${createdRoom.room_name}\nJoin Link: ${inviteUrl}\nRoom Code: ${createdRoom.room_code}\nMeeting Passcode: ${meetingPasscode}`
+    navigator.clipboard.writeText(text).then(() => alert('Class details copied!')).catch(() => alert('Unable to copy class details. Please copy them manually.'))
   }
 
   if (createdRoom) {
     return (
       <main className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 p-4 sm:p-8">
-        <div className="max-w-md w-full bg-white rounded-lg shadow-xl p-5 sm:p-8">
-          <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-6 text-center">Class Created! ✅</h2>
+        <div className="max-w-md w-full bg-white text-black rounded-lg shadow-xl p-5 sm:p-8">
+          <h2 className="text-xl sm:text-2xl font-bold text-black mb-6 text-center">Class Created! ✅</h2>
           <div className="space-y-4 mb-6">
             <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Student Invite Link</label>
+              <div className="px-4 py-2 bg-gray-50 border border-gray-300 rounded-md text-sm text-black break-all">
+                <a className="text-black underline hover:text-gray-700" href={`/join/${createdRoom.invite_code}`}>
+                  {typeof window !== 'undefined' ? `${window.location.origin}/join/${createdRoom.invite_code}` : `/join/${createdRoom.invite_code}`}
+                </a>
+              </div>
+            </div>
+            <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Class Name</label>
-              <div className="px-4 py-2 bg-gray-50 border border-gray-300 rounded-md break-words">{createdRoom.room_name}</div>
+              <div className="px-4 py-2 bg-gray-50 border border-gray-300 rounded-md text-black break-words">{createdRoom.room_name}</div>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Room Code</label>
-              <div className="px-4 py-2 bg-gray-50 border border-gray-300 rounded-md font-mono text-lg break-all">{createdRoom.room_code}</div>
+              <div className="px-4 py-2 bg-gray-50 border border-gray-300 rounded-md font-mono text-lg text-black break-all">{createdRoom.room_code}</div>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Meeting Passcode</label>
               <div className="relative">
-                <div className="px-4 py-2 min-h-[44px] bg-gray-50 border border-gray-300 rounded-md font-mono text-lg pr-20 break-all">
+                <div className="px-4 py-2 min-h-[44px] bg-gray-50 border border-gray-300 rounded-md font-mono text-lg text-black pr-20 break-all">
                   {showPasscode ? meetingPasscode : '••••••••'}
                 </div>
                 <button
                   type="button"
                   onClick={() => setShowPasscode(!showPasscode)}
-                  className="absolute right-1 top-1/2 -translate-y-1/2 px-3 py-2 text-sm text-blue-600 hover:text-blue-800"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 px-3 py-2 text-sm text-gray-900 hover:text-black"
                 >
                   {showPasscode ? 'Hide' : 'Show'}
                 </button>
               </div>
             </div>
-            <div className="text-sm text-gray-600 bg-blue-50 p-3 rounded-md">
-              Share <strong>Room Code</strong> and <strong>Meeting Passcode</strong> with students.
+            <div className="text-sm text-gray-800 bg-blue-50 p-3 rounded-md">
+              Share the <strong>invite link</strong> (or Room Code) and <strong>Meeting Passcode</strong> with students. Students wait for your approval before entering.
             </div>
           </div>
           <div className="space-y-3">

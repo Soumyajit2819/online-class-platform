@@ -93,13 +93,13 @@ class TestCreateRoom:
 
 class TestJoinRoom:
     @pytest.mark.asyncio
-    async def test_nonexistent_room_returns_404(self):
+    async def test_direct_join_endpoint_cannot_bypass_waiting_room(self):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             r = await c.post("/api/student/join-room", json={
                 "student_name": "Alice", "room_code": "NOPE00",
                 "meeting_passcode": "abc123"
             })
-        assert r.status_code == 404
+        assert r.status_code == 403
 
     @pytest.mark.asyncio
     @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
@@ -122,7 +122,7 @@ class TestJoinRoom:
     @pytest.mark.asyncio
     @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
     @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
-    async def test_correct_passcode_joins(self, mock_parts, mock_create):
+    async def test_correct_passcode_cannot_issue_direct_token(self, mock_parts, mock_create):
         mock_create.return_value = True
         mock_parts.return_value = []
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -135,8 +135,69 @@ class TestJoinRoom:
                 "student_name": "Alice", "room_code": room_code,
                 "meeting_passcode": "join123"
             })
-        assert r2.status_code == 200
-        assert "token" in r2.json()
+        assert r2.status_code == 403
+
+
+class TestWaitingRoom:
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
+    async def test_approval_is_required_before_student_token(self, mock_parts, mock_create):
+        mock_create.return_value = True
+        mock_parts.return_value = []
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Math", "meeting_passcode": "join123"
+            })
+            room_code = created.json()["room_code"]
+            invite_code = created.json()["invite_code"]
+            session_id = "a" * 36
+            pending = await c.post("/api/student/join-requests", json={
+                "student_name": "Alice", "invite_code": invite_code,
+                "meeting_passcode": "join123", "session_id": session_id,
+            })
+            assert pending.status_code == 200
+            request_id = pending.json()["request_id"]
+            denied = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+            assert denied.status_code == 403
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            teacher_access_key = created.json()["teacher_access_key"]
+            approved = await c.post("/api/teacher/approve-join-request", json={
+                "room_code": room_code, "teacher_identity": teacher_identity,
+                "teacher_access_key": teacher_access_key, "request_id": request_id,
+            })
+            assert approved.status_code == 200
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+            assert token.status_code == 200
+            assert "token" in token.json()
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_rejected_request_cannot_be_recreated_or_tokenized(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Math", "meeting_passcode": "join123"
+            })
+            room_code = created.json()["room_code"]
+            session_id = "b" * 36
+            pending = await c.post("/api/student/join-requests", json={
+                "student_name": "Alice", "room_code": room_code,
+                "meeting_passcode": "join123", "session_id": session_id,
+            })
+            request_id = pending.json()["request_id"]
+            teacher_identity = session_state.get_class(room_code)["teacher_identity"]
+            teacher_access_key = created.json()["teacher_access_key"]
+            rejected = await c.post("/api/teacher/reject-join-request", json={
+                "room_code": room_code, "teacher_identity": teacher_identity,
+                "teacher_access_key": teacher_access_key, "request_id": request_id,
+            })
+            assert rejected.status_code == 200
+            repeated = await c.post("/api/student/join-requests", json={
+                "student_name": "Alice", "room_code": room_code,
+                "meeting_passcode": "join123", "session_id": session_id,
+            })
+            assert repeated.status_code == 403
 
 
 # ---------------------------------------------------------------------------

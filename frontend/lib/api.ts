@@ -20,6 +20,26 @@ export interface RoomResponse {
   room_name: string;
   token: string;
   livekit_url: string;
+  invite_code?: string;
+  teacher_access_key?: string;
+}
+
+export interface JoinRequest {
+  request_id: string;
+  room_code: string;
+  student_name: string;
+  status: 'WAITING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
+}
+
+export interface CreateJoinRequestData {
+  student_name: string;
+  meeting_passcode: string;
+  room_code?: string;
+  invite_code?: string;
+  session_id: string;
 }
 
 export interface ClassInfo {
@@ -247,6 +267,36 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     });
+  },
+
+  async getInviteInfo(inviteCode: string): Promise<{ room_code: string; class_name: string; teacher_name: string }> {
+    return fetchApi(`/api/join/${encodeURIComponent(inviteCode)}`);
+  },
+
+  async createJoinRequest(data: CreateJoinRequestData): Promise<JoinRequest> {
+    return fetchApi('/api/student/join-requests', { method: 'POST', body: JSON.stringify(data) });
+  },
+
+  async getJoinRequest(requestId: string, sessionId: string): Promise<JoinRequest> {
+    return fetchApi(`/api/student/join-requests/${encodeURIComponent(requestId)}?session_id=${encodeURIComponent(sessionId)}`);
+  },
+
+  async getApprovedJoinToken(requestId: string, sessionId: string): Promise<RoomResponse> {
+    return fetchApi(`/api/student/join-requests/${encodeURIComponent(requestId)}/token`, {
+      method: 'POST', body: JSON.stringify({ session_id: sessionId }),
+    });
+  },
+
+  async getWaitingJoinRequests(roomCode: string, teacherIdentity: string): Promise<{ requests: JoinRequest[] }> {
+    return fetchApi(`/api/teacher/${encodeURIComponent(roomCode)}/join-requests?teacher_identity=${encodeURIComponent(teacherIdentity)}`);
+  },
+
+  async approveJoinRequest(data: { room_code: string; teacher_identity: string; teacher_access_key: string; request_id: string }): Promise<JoinRequest> {
+    return fetchApi('/api/teacher/approve-join-request', { method: 'POST', body: JSON.stringify(data) });
+  },
+
+  async rejectJoinRequest(data: { room_code: string; teacher_identity: string; teacher_access_key: string; request_id: string }): Promise<JoinRequest> {
+    return fetchApi('/api/teacher/reject-join-request', { method: 'POST', body: JSON.stringify(data) });
   },
 
   // Passcode verification

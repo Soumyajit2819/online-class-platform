@@ -75,10 +75,14 @@ class SessionState:
         self.active_classes: Dict[str, Dict[str, Any]] = {}
         self.blocked_participants: Dict[str, List[str]] = {}
         self.teacher_sessions: Dict[str, str] = {}
+        self.invite_codes: Dict[str, str] = {}
+        self.join_requests: Dict[str, Dict[str, Any]] = {}
+        self.join_request_sessions: Dict[tuple[str, str], str] = {}
 
     def create_class(self, room_code, livekit_room_name, class_name, teacher_name,
                      teacher_identity, meeting_passcode_hash, max_participants,
-                     student_microphone_policy, student_camera_policy):
+                     student_microphone_policy, student_camera_policy, invite_code,
+                     teacher_access_key):
         self.active_classes[room_code] = {
             "livekit_room_name":        livekit_room_name,
             "class_name":               class_name,
@@ -93,8 +97,11 @@ class SessionState:
             "is_recording":             False,
             "active_recording_id":      None,
             "created_at":               datetime.utcnow(),
+            "invite_code":              invite_code,
+            "teacher_access_key":       teacher_access_key,
         }
         self.teacher_sessions[teacher_identity] = room_code
+        self.invite_codes[invite_code] = room_code
 
     def get_class(self, room_code: str) -> Optional[Dict[str, Any]]:
         return self.active_classes.get(room_code)
@@ -147,6 +154,49 @@ class SessionState:
 
     def is_participant_blocked(self, room_code: str, identity: str) -> bool:
         return identity in self.blocked_participants.get(room_code, [])
+
+    def get_room_code_for_invite(self, invite_code: str) -> Optional[str]:
+        return self.invite_codes.get(invite_code)
+
+    def get_join_request_for_session(self, room_code: str, session_id: str) -> Optional[Dict[str, Any]]:
+        request_id = self.join_request_sessions.get((room_code, session_id))
+        return self.join_requests.get(request_id) if request_id else None
+
+    def create_join_request(self, room_code: str, student_name: str, session_id: str) -> Dict[str, Any]:
+        existing = self.get_join_request_for_session(room_code, session_id)
+        if existing:
+            return existing
+        request_id = f"jr_{secrets.token_urlsafe(16)}"
+        request = {
+            "request_id": request_id,
+            "room_code": room_code,
+            "student_name": student_name.strip(),
+            "student_identity": f"student_{secrets.token_urlsafe(8)}",
+            "session_id": session_id,
+            "status": "WAITING",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+            "decided_at": None,
+        }
+        self.join_requests[request_id] = request
+        self.join_request_sessions[(room_code, session_id)] = request_id
+        return request
+
+    def get_join_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        return self.join_requests.get(request_id)
+
+    def get_waiting_join_requests(self, room_code: str) -> List[Dict[str, Any]]:
+        return [r for r in self.join_requests.values()
+                if r["room_code"] == room_code and r["status"] == "WAITING"]
+
+    def decide_join_request(self, request_id: str, status: str) -> Optional[Dict[str, Any]]:
+        request = self.get_join_request(request_id)
+        if not request or request["status"] != "WAITING":
+            return None
+        request["status"] = status
+        request["updated_at"] = datetime.utcnow()
+        request["decided_at"] = request["updated_at"]
+        return request
 
     def get_teacher_identity(self, room_code: str) -> Optional[str]:
         c = self.get_class(room_code)

@@ -30,11 +30,39 @@ class JoinRoomRequest(BaseModel):
     meeting_passcode: str
 
 
+class JoinRequestStatus(str, Enum):
+    WAITING = "WAITING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+
+
+class CreateJoinRequest(BaseModel):
+    student_name: str
+    meeting_passcode: str
+    room_code: Optional[str] = None
+    invite_code: Optional[str] = None
+    session_id: str
+
+
+class JoinRequestTokenRequest(BaseModel):
+    session_id: str
+
+
+class JoinRequestDecision(BaseModel):
+    room_code: str
+    teacher_identity: str
+    teacher_access_key: str
+    request_id: str
+
+
 class RoomResponse(BaseModel):
     room_code: str
     room_name: str
     token: str
     livekit_url: str
+    invite_code: Optional[str] = None
+    teacher_access_key: Optional[str] = None
 
 
 class ModerationRequest(BaseModel):
