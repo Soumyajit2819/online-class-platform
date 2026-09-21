@@ -196,7 +196,7 @@ function ClassroomContent({
             controls={{
               camera: !isTeacher && cameraPolicy === 'locked' ? false : true,
               microphone: !isTeacher && micPolicy === 'locked' ? false : true,
-              screenShare: false,
+              screenShare: true,
               leave: true,
               chat: false,
             }}

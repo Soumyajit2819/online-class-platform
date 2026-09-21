@@ -1,3 +1,4 @@
+
 'use client'
 
 import { useState } from 'react'
@@ -136,27 +137,27 @@ function TeacherForm() {
             <label className="block text-sm font-medium text-gray-700 mb-1">Teacher Name</label>
             <input type="text" value={teacherName} onChange={e => setTeacherName(e.target.value)}
               autoComplete="off" data-lpignore="true"
-              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500"
+              className="w-full px-4 py-2.5 sm:py-2 bg-white text-black caret-black placeholder:text-gray-400 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               placeholder="Your name" required />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Class Name</label>
             <input type="text" value={className} onChange={e => setClassName(e.target.value)}
               autoComplete="off" data-lpignore="true"
-              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500"
+              className="w-full px-4 py-2.5 sm:py-2 bg-white text-black caret-black placeholder:text-gray-400 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               placeholder="e.g. DBMS - Normalization" required />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Meeting Passcode</label>
             <input type="text" value={meetingPasscode} onChange={e => setMeetingPasscode(e.target.value)}
               autoComplete="off" data-lpignore="true" data-form-type="other"
-              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500"
+              className="w-full px-4 py-2.5 sm:py-2 bg-white text-black caret-black placeholder:text-gray-400 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               placeholder="Passcode for students to join" required />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Student Microphones</label>
             <select value={micPolicy} onChange={e => setMicPolicy(e.target.value as any)}
-              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500">
+              className="w-full px-4 py-2.5 sm:py-2 bg-white text-black border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
               <option value="allowed">Allowed</option>
               <option value="muted_by_default">Muted by Default</option>
               <option value="locked">Locked</option>
@@ -165,7 +166,7 @@ function TeacherForm() {
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Student Cameras</label>
             <select value={cameraPolicy} onChange={e => setCameraPolicy(e.target.value as any)}
-              className="w-full px-4 py-2.5 sm:py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500">
+              className="w-full px-4 py-2.5 sm:py-2 bg-white text-black border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
               <option value="allowed">Allowed</option>
               <option value="off_by_default">Off by Default</option>
               <option value="locked">Locked</option>
