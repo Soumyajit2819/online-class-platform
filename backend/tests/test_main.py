@@ -711,6 +711,48 @@ class TestTokenGeneration:
 
 class TestPasscodeEndpoints:
     @pytest.mark.asyncio
+    async def test_teacher_passcode_preflight_allows_local_development_origin(self):
+        headers = {
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        }
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.options("/api/auth/verify-teacher-passcode", headers=headers)
+        assert r.status_code == 200
+        assert r.headers["access-control-allow-origin"] == "http://localhost:3000"
+        assert "POST" in r.headers["access-control-allow-methods"]
+
+    @pytest.mark.asyncio
+    async def test_teacher_passcode_post_reaches_verification_after_local_preflight(self):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.post(
+                "/api/auth/verify-teacher-passcode",
+                headers={"Origin": "http://localhost:3000"},
+                json={"passcode": ""},
+            )
+        assert r.status_code == 400
+        assert r.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+    @pytest.mark.asyncio
+    async def test_teacher_passcode_preflight_rejects_untrusted_origin(self):
+        headers = {
+            "Origin": "https://untrusted.example",
+            "Access-Control-Request-Method": "POST",
+        }
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            r = await c.options("/api/auth/verify-teacher-passcode", headers=headers)
+        assert r.status_code == 400
+
+    def test_production_cors_does_not_enable_localhost_regex(self):
+        previous = settings.ENVIRONMENT
+        settings.ENVIRONMENT = "production"
+        try:
+            assert settings.local_origin_regex is None
+        finally:
+            settings.ENVIRONMENT = previous
+
+    @pytest.mark.asyncio
     async def test_verify_teacher_passcode_empty_returns_400(self):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             r = await c.post("/api/auth/verify-teacher-passcode", json={"passcode": ""})

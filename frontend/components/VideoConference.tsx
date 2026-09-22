@@ -3,10 +3,8 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
   LiveKitRoom,
-  VideoConference,
   RoomAudioRenderer,
   ControlBar,
-  GridLayout,
   ParticipantTile,
   useTracks,
   useParticipants,
@@ -210,11 +208,11 @@ function ClassroomContent({
         </div>
       </div>
 
-      {/* Video grid */}
+      {/* The custom layout intentionally does not use GridLayout pagination.
+          Its fixed-height mobile container can otherwise make later pages
+          inaccessible. Every LiveKit track remains mounted in this scrollable grid. */}
       <div className="shrink-0 min-w-0 overflow-hidden p-2 sm:p-4 h-[50vh] min-h-[240px] sm:h-[55vh] lg:h-auto lg:min-h-0 lg:shrink lg:col-start-1 lg:row-start-2">
-        <GridLayout tracks={tracks} className="h-full">
-          <ParticipantTile className="rounded-lg overflow-hidden" />
-        </GridLayout>
+        <ParticipantVideoLayout tracks={tracks} />
       </div>
 
       {/* Control bar */}
@@ -281,6 +279,67 @@ function ClassroomContent({
 
       {/* Audio renderer */}
       <RoomAudioRenderer />
+    </div>
+  )
+}
+
+type VideoTrackReference = ReturnType<typeof useTracks>
+
+function trackId(track: VideoTrackReference[number]) {
+  return `${track.participant.identity}:${track.source}`
+}
+
+function ParticipantVideoLayout({ tracks }: { tracks: VideoTrackReference }) {
+  const [pinnedTrackId, setPinnedTrackId] = useState<string | null>(null)
+  const pinnedTrack = pinnedTrackId ? tracks.find((track) => trackId(track) === pinnedTrackId) : undefined
+  const otherTracks = pinnedTrack ? tracks.filter((track) => trackId(track) !== pinnedTrackId) : tracks
+
+  // A reconnect, departure, or unpublished camera/screen share removes that
+  // track from useTracks. Clear the viewer-local pin instead of leaving an
+  // empty focused area behind.
+  useEffect(() => {
+    if (pinnedTrackId && !pinnedTrack) setPinnedTrackId(null)
+  }, [pinnedTrackId, pinnedTrack])
+
+  const renderTile = (track: VideoTrackReference[number], prominent = false) => {
+    const id = trackId(track)
+    const isPinned = id === pinnedTrackId
+    return (
+      <div key={id} className={`relative min-w-0 aspect-video ${prominent ? 'h-full' : ''}`}>
+        <ParticipantTile trackRef={track} className="h-full w-full rounded-lg overflow-hidden" />
+        <button
+          type="button"
+          aria-label={isPinned ? `Unpin ${track.participant.name || track.participant.identity}` : `Pin ${track.participant.name || track.participant.identity}`}
+          aria-pressed={isPinned}
+          onClick={() => setPinnedTrackId(isPinned ? null : id)}
+          className="absolute right-2 top-2 z-10 rounded-md bg-black/70 px-2 py-1 text-xs font-medium text-white shadow hover:bg-black/90 focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          {isPinned ? 'Unpin' : 'Pin'}
+        </button>
+      </div>
+    )
+  }
+
+  if (pinnedTrack) {
+    return (
+      <div className="flex h-full min-h-0 flex-col gap-2">
+        <div className="min-h-0 flex-1">{renderTile(pinnedTrack, true)}</div>
+        {otherTracks.length > 0 && (
+          <div className="max-h-[42%] shrink-0 overflow-y-auto overscroll-contain pr-1">
+            <div className="grid grid-cols-1 min-[380px]:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2">
+              {otherTracks.map((track) => renderTile(track))}
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full overflow-y-auto overscroll-contain pr-1">
+      <div className="grid grid-cols-1 min-[380px]:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2">
+        {tracks.map((track) => renderTile(track))}
+      </div>
     </div>
   )
 }

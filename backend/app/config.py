@@ -46,6 +46,13 @@ class Settings:
         """Parse comma-separated FRONTEND_URL into a list."""
         return [o.strip() for o in self.FRONTEND_URL.split(",") if o.strip()]
 
+    @property
+    def local_origin_regex(self) -> str | None:
+        """Allow local Next.js dev servers on any port, never in production."""
+        if self.is_production:
+            return None
+        return r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
     def validate(self) -> bool:
         required = [
             ("LIVEKIT_URL",        self.LIVEKIT_URL),
