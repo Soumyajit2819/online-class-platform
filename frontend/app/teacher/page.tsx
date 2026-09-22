@@ -50,7 +50,7 @@ function TeacherForm() {
       const response = await api.createRoom({
         teacher_name: teacherName,
         room_name: className,
-        meeting_passcode: meetingPasscode,
+        meeting_passcode: meetingPasscode || undefined,
         max_participants: maxParticipants,
         student_microphone_policy: micPolicy,
         student_camera_policy: cameraPolicy,
@@ -103,7 +103,7 @@ function TeacherForm() {
               <label className="block text-sm font-medium text-gray-700 mb-1">Room Code</label>
               <div className="px-4 py-2 bg-gray-50 border border-gray-300 rounded-md font-mono text-lg text-black break-all">{createdRoom.room_code}</div>
             </div>
-            <div>
+            {meetingPasscode && <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Meeting Passcode</label>
               <div className="relative">
                 <div className="px-4 py-2 min-h-[44px] bg-gray-50 border border-gray-300 rounded-md font-mono text-lg text-black pr-20 break-all">
@@ -117,9 +117,9 @@ function TeacherForm() {
                   {showPasscode ? 'Hide' : 'Show'}
                 </button>
               </div>
-            </div>
+            </div>}
             <div className="text-sm text-gray-800 bg-blue-50 p-3 rounded-md">
-              Share the <strong>invite link</strong> (or Room Code) and <strong>Meeting Passcode</strong> with students. Students wait for your approval before entering.
+              Share the <strong>invite link</strong> (or Room Code){meetingPasscode && <> and <strong>Meeting Passcode</strong></>} with students. Students wait for your approval before entering.
             </div>
           </div>
           <div className="space-y-3">
@@ -161,7 +161,7 @@ function TeacherForm() {
             <input type="text" value={meetingPasscode} onChange={e => setMeetingPasscode(e.target.value)}
               autoComplete="off" data-lpignore="true" data-form-type="other"
               className="w-full px-4 py-2.5 sm:py-2 bg-white text-black caret-black placeholder:text-gray-400 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              placeholder="Passcode for students to join" required />
+              placeholder="Optional passcode for students to join" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Student Microphones</label>

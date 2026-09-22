@@ -8,7 +8,7 @@ function recordingsAccessToken(): string | null {
 export interface CreateRoomRequest {
   teacher_name: string;
   room_name: string;
-  meeting_passcode: string;
+  meeting_passcode?: string;
   max_participants?: number;
   student_microphone_policy?: 'allowed' | 'muted_by_default' | 'locked';
   student_camera_policy?: 'allowed' | 'off_by_default' | 'locked';
@@ -17,7 +17,7 @@ export interface CreateRoomRequest {
 export interface JoinRoomRequest {
   student_name: string;
   room_code: string;
-  meeting_passcode: string;
+  meeting_passcode?: string;
 }
 
 export interface RoomResponse {
@@ -40,8 +40,8 @@ export interface JoinRequest {
 }
 
 export interface CreateJoinRequestData {
-  student_name: string;
-  meeting_passcode: string;
+  google_credential: string;
+  meeting_passcode?: string;
   room_code?: string;
   invite_code?: string;
   session_id: string;
@@ -56,6 +56,29 @@ export interface ClassInfo {
   max_participants: number;
   student_microphone_policy: 'allowed' | 'muted_by_default' | 'locked';
   student_camera_policy: 'allowed' | 'off_by_default' | 'locked';
+  meeting_passcode_required?: boolean;
+}
+
+export interface ClassroomChatMessage {
+  id: string;
+  name: string;
+  text: string;
+  created_at: string;
+}
+
+export interface ClassroomChatAction {
+  action: 'snapshot' | 'set_enabled' | 'send_message';
+  teacher_identity?: string;
+  teacher_access_key?: string;
+  join_request_id?: string;
+  session_id?: string;
+  enabled?: boolean;
+  text?: string;
+}
+
+export interface ClassroomChatState {
+  enabled: boolean;
+  messages: ClassroomChatMessage[];
 }
 
 export interface Participant {
@@ -209,8 +232,9 @@ export const api = {
     return fetchApi('/api/teacher/unrestrict-student-microphone', { method: 'POST', body: JSON.stringify(data) });
   },
 
-  async getStudentMicrophoneRestriction(roomCode: string, studentIdentity: string): Promise<MicrophoneRestriction> {
-    return fetchApi(`/api/class/${encodeURIComponent(roomCode)}/microphone-restriction/${encodeURIComponent(studentIdentity)}`);
+  async getStudentMicrophoneRestriction(roomCode: string, studentIdentity: string, requestId: string, sessionId: string): Promise<MicrophoneRestriction> {
+    const query = `request_id=${encodeURIComponent(requestId)}&session_id=${encodeURIComponent(sessionId)}`;
+    return fetchApi(`/api/class/${encodeURIComponent(roomCode)}/microphone-restriction/${encodeURIComponent(studentIdentity)}?${query}`);
   },
 
   async setMicrophonePolicy(data: SetPolicyRequest): Promise<{ success: boolean; message: string }> {
@@ -305,7 +329,7 @@ export const api = {
     });
   },
 
-  async getInviteInfo(inviteCode: string): Promise<{ room_code: string; class_name: string; teacher_name: string }> {
+  async getInviteInfo(inviteCode: string): Promise<{ room_code: string; class_name: string; teacher_name: string; meeting_passcode_required: boolean }> {
     return fetchApi(`/api/join/${encodeURIComponent(inviteCode)}`);
   },
 
@@ -384,6 +408,12 @@ export const api = {
   // Class info endpoints
   async getClassInfo(roomCode: string): Promise<ClassInfo> {
     return fetchApi(`/api/class/${roomCode}`);
+  },
+
+  async classroomChat(roomCode: string, data: ClassroomChatAction): Promise<ClassroomChatState> {
+    return fetchApi(`/api/class/${encodeURIComponent(roomCode)}/chat`, {
+      method: 'POST', body: JSON.stringify(data),
+    });
   },
 
   async getParticipants(roomCode: string): Promise<ParticipantsResponse> {

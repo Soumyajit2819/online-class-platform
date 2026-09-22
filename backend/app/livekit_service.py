@@ -91,6 +91,8 @@ class SessionState:
             "created_at":               datetime.utcnow(),
             "invite_code":              invite_code,
             "teacher_access_key":       teacher_access_key,
+            "chat_enabled":              True,
+            "chat_messages":             [],
         }
         self.teacher_sessions[teacher_identity] = room_code
         self.invite_codes[invite_code] = room_code
@@ -131,6 +133,9 @@ class SessionState:
     def verify_passcode(self, room_code: str, passcode: str) -> bool:
         c = self.get_class(room_code)
         if not c: return False
+        if c["meeting_passcode_hash"] is None:
+            return not (passcode or "").strip()
+        if not passcode: return False
         return c["meeting_passcode_hash"] == hashlib.sha256(passcode.encode()).hexdigest()
 
     def block_participant(self, room_code: str, identity: str):
@@ -158,6 +163,7 @@ class SessionState:
             "mode": "TIMED" if duration_minutes else "UNTIL_TEACHER",
             "expires_at": now + timedelta(minutes=duration_minutes) if duration_minutes else None,
             "updated_at": now,
+            "enforced_sessions": set(),
         }
         self.microphone_restrictions[(room_code, identity)] = restriction
         return restriction
@@ -167,6 +173,20 @@ class SessionState:
         # owns the transition so it can restore LiveKit permission atomically
         # with removing the server-side restriction.
         return self.microphone_restrictions.get((room_code, identity))
+
+    def microphone_restriction_enforced(self, room_code: str, identity: str, session_id: str) -> bool:
+        restriction = self.get_microphone_restriction(room_code, identity)
+        return bool(restriction and session_id in restriction.setdefault("enforced_sessions", set()))
+
+    def mark_microphone_restriction_enforced(self, room_code: str, identity: str, session_id: str) -> None:
+        restriction = self.get_microphone_restriction(room_code, identity)
+        if restriction:
+            restriction.setdefault("enforced_sessions", set()).add(session_id)
+
+    def reset_microphone_restriction_enforcement(self, room_code: str, identity: str, session_id: str) -> None:
+        restriction = self.get_microphone_restriction(room_code, identity)
+        if restriction:
+            restriction.setdefault("enforced_sessions", set()).discard(session_id)
 
     def expire_microphone_restriction(self, room_code: str, identity: str,
                                       expected_expires_at: Optional[datetime] = None) -> bool:
@@ -201,7 +221,8 @@ class SessionState:
         request_id = self.join_request_sessions.get((room_code, session_id))
         return self.join_requests.get(request_id) if request_id else None
 
-    def create_join_request(self, room_code: str, student_name: str, session_id: str) -> Dict[str, Any]:
+    def create_join_request(self, room_code: str, student_name: str, session_id: str,
+                            student_identity: Optional[str] = None) -> Dict[str, Any]:
         existing = self.get_join_request_for_session(room_code, session_id)
         if existing:
             return existing
@@ -210,7 +231,7 @@ class SessionState:
             "request_id": request_id,
             "room_code": room_code,
             "student_name": student_name.strip(),
-            "student_identity": f"student_{secrets.token_urlsafe(8)}",
+            "student_identity": student_identity or f"student_{secrets.token_urlsafe(8)}",
             "session_id": session_id,
             "status": "WAITING",
             "created_at": datetime.utcnow(),
@@ -259,6 +280,33 @@ class SessionState:
     def get_camera_policy(self, room_code: str) -> CameraPolicy:
         c = self.get_class(room_code)
         return c.get("student_camera_policy", CameraPolicy.ALLOWED) if c else CameraPolicy.ALLOWED
+
+    def set_chat_enabled(self, room_code: str, enabled: bool) -> bool:
+        c = self.get_class(room_code)
+        if not c:
+            return False
+        c["chat_enabled"] = enabled
+        return True
+
+    def add_chat_message(self, room_code: str, name: str, text: str) -> Optional[Dict[str, Any]]:
+        c = self.get_class(room_code)
+        if not c or not c["chat_enabled"]:
+            return None
+        message = {
+            "id": f"chat_{secrets.token_urlsafe(10)}",
+            "name": name,
+            "text": text,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        c["chat_messages"].append(message)
+        c["chat_messages"] = c["chat_messages"][-200:]
+        return message
+
+    def get_chat(self, room_code: str) -> Optional[Dict[str, Any]]:
+        c = self.get_class(room_code)
+        if not c:
+            return None
+        return {"enabled": c["chat_enabled"], "messages": list(c["chat_messages"])}
 
 
 # ---------------------------------------------------------------------------

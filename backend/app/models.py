@@ -18,7 +18,7 @@ class CameraPolicy(str, Enum):
 class CreateRoomRequest(BaseModel):
     teacher_name: str
     room_name: str
-    meeting_passcode: str
+    meeting_passcode: Optional[str] = None
     max_participants: int = 50
     student_microphone_policy: MicrophonePolicy = MicrophonePolicy.ALLOWED
     student_camera_policy: CameraPolicy = CameraPolicy.ALLOWED
@@ -38,8 +38,8 @@ class JoinRequestStatus(str, Enum):
 
 
 class CreateJoinRequest(BaseModel):
-    student_name: str
-    meeting_passcode: str
+    google_credential: str
+    meeting_passcode: Optional[str] = None
     room_code: Optional[str] = None
     invite_code: Optional[str] = None
     session_id: str
@@ -47,6 +47,16 @@ class CreateJoinRequest(BaseModel):
 
 class JoinRequestTokenRequest(BaseModel):
     session_id: str
+
+
+class ClassroomChatAction(BaseModel):
+    action: Literal["snapshot", "set_enabled", "send_message"]
+    teacher_identity: Optional[str] = None
+    teacher_access_key: Optional[str] = None
+    join_request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    enabled: Optional[bool] = None
+    text: Optional[str] = None
 
 
 class JoinRequestDecision(BaseModel):

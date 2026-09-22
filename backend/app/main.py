@@ -13,10 +13,12 @@ import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 
 from .config import settings
 from .models import (
-    CreateRoomRequest, JoinRoomRequest, RoomResponse, CreateJoinRequest,
+    CreateRoomRequest, JoinRoomRequest, RoomResponse, CreateJoinRequest, ClassroomChatAction,
     JoinRequestTokenRequest, JoinRequestDecision,
     ModerationRequest, MuteAllRequest, SetPolicyRequest,
     StudentMuteRestrictionRequest, StudentUnmuteRestrictionRequest,
@@ -125,8 +127,6 @@ async def create_room(request: CreateRoomRequest):
         raise HTTPException(400, "Teacher name is required")
     if not request.room_name.strip():
         raise HTTPException(400, "Class name is required")
-    if not request.meeting_passcode.strip():
-        raise HTTPException(400, "Meeting passcode is required")
     if not (2 <= request.max_participants <= 50):
         raise HTTPException(400, "Max participants must be between 2 and 50")
 
@@ -135,7 +135,7 @@ async def create_room(request: CreateRoomRequest):
     teacher_access_key = secrets.token_urlsafe(32)
     livekit_room     = livekit_service.generate_livekit_room_name()
     teacher_identity = f"teacher_{secrets.token_urlsafe(8)}"
-    passcode_hash    = livekit_service.hash_passcode(request.meeting_passcode)
+    passcode_hash    = livekit_service.hash_passcode(request.meeting_passcode) if request.meeting_passcode and request.meeting_passcode.strip() else None
 
     await livekit_service.create_room(livekit_room, max_participants=request.max_participants)
 
@@ -225,11 +225,30 @@ def _schedule_microphone_restriction_expiry(room_code: str, student_identity: st
             room_code, student_identity, restriction["expires_at"]))
 
 
+def verify_google_credential(credential: str) -> dict[str, str]:
+    """Verify GIS-issued ID tokens and return only the session identity fields."""
+    if not settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google sign-in is not configured")
+    if not credential or len(credential) > 8192:
+        raise HTTPException(401, "Google sign-in failed. Please try again.")
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), audience=settings.GOOGLE_CLIENT_ID
+        )
+    except Exception:
+        # Never log or echo the credential. Verification failures all have the
+        # same public response, including signature, expiry, and audience errors.
+        raise HTTPException(401, "Google sign-in failed. Please try again.")
+    if claims.get("aud") != settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(401, "Google sign-in failed. Please try again.")
+    subject = claims.get("sub")
+    name = claims.get("name")
+    if not isinstance(subject, str) or not subject or not isinstance(name, str) or not name.strip():
+        raise HTTPException(401, "Google account did not provide a usable identity.")
+    return {"sub": subject, "name": name.strip()[:256]}
+
+
 def _validate_join_request(request: CreateJoinRequest):
-    if not request.student_name.strip():
-        raise HTTPException(400, "Student name is required")
-    if not request.meeting_passcode.strip():
-        raise HTTPException(400, "Meeting passcode is required")
     if not request.session_id.strip() or len(request.session_id) < 16:
         raise HTTPException(400, "Invalid join session")
     room_code = request.room_code.upper().strip() if request.room_code else None
@@ -246,7 +265,7 @@ def _validate_join_request(request: CreateJoinRequest):
         raise HTTPException(404, "Class not found or has ended")
     if session_state.is_class_locked(room_code):
         raise HTTPException(403, "Class is locked. New students cannot join.")
-    if not session_state.verify_passcode(room_code, request.meeting_passcode):
+    if not session_state.verify_passcode(room_code, request.meeting_passcode or ""):
         raise HTTPException(403, "Incorrect meeting passcode")
     return room_code
 
@@ -257,16 +276,20 @@ async def get_invite_info(invite_code: str):
     if not room_code or not session_state.is_class_active(room_code):
         raise HTTPException(404, "This class link is invalid or no longer available")
     c = session_state.get_class(room_code)
-    return {"room_code": room_code, "class_name": c["class_name"], "teacher_name": c["teacher_name"]}
+    return {"room_code": room_code, "class_name": c["class_name"], "teacher_name": c["teacher_name"], "meeting_passcode_required": c["meeting_passcode_hash"] is not None}
 
 
 @app.post("/api/student/join-requests")
 async def create_join_request(request: CreateJoinRequest):
     room_code = _validate_join_request(request)
+    student = await asyncio.to_thread(verify_google_credential, request.google_credential)
     existing = session_state.get_join_request_for_session(room_code, request.session_id)
     if existing and existing["status"] == "REJECTED":
         raise HTTPException(403, "Your request to join this class was declined.")
-    join_request = session_state.create_join_request(room_code, request.student_name, request.session_id)
+    join_request = session_state.create_join_request(
+        room_code, student["name"], request.session_id,
+        student_identity=f"google_{student['sub']}",
+    )
     return _serialize_join_request(join_request)
 
 
@@ -304,9 +327,16 @@ async def get_approved_join_token(request_id: str, request: JoinRequestTokenRequ
             class_info["livekit_room_name"], join_request["student_identity"], True)
     microphone_restricted = session_state.get_microphone_restriction(
         room_code, join_request["student_identity"]) is not None
+    if microphone_restricted:
+        session_state.reset_microphone_restriction_enforcement(
+            room_code, join_request["student_identity"], join_request["session_id"])
     camera_policy = session_state.get_camera_policy(room_code)
     publish_sources = ["screen_share", "screen_share_audio"]
-    if not microphone_restricted and mic_policy != MicrophonePolicy.LOCKED:
+    # Timed/temporary restrictions are enforced with LiveKit's participant
+    # publish permission. Keep the token capability so expiry can restore
+    # microphone use without forcing the student to rejoin. The client still
+    # requires the student's explicit unmute action.
+    if mic_policy != MicrophonePolicy.LOCKED:
         publish_sources.append("microphone")
     if camera_policy != CameraPolicy.LOCKED:
         publish_sources.append("camera")
@@ -355,6 +385,49 @@ async def reject_join_request(request: JoinRequestDecision):
 # Class info
 # ---------------------------------------------------------------------------
 
+def _authorize_chat_actor(room_code: str, request: ClassroomChatAction):
+    normalized = room_code.upper()
+    class_info = session_state.get_class(normalized)
+    if not class_info or not session_state.is_class_active(normalized):
+        raise HTTPException(404, "Class not found or has ended")
+    if request.teacher_identity and request.teacher_access_key:
+        teacher = _verify_teacher(normalized, request.teacher_identity)
+        if not secrets.compare_digest(teacher["teacher_access_key"], request.teacher_access_key):
+            raise HTTPException(403, "Only the authorized teacher can control classroom chat")
+        return "teacher", teacher, None
+    join_request = session_state.get_join_request(request.join_request_id) if request.join_request_id else None
+    if (not join_request or join_request["room_code"] != normalized or
+            not request.session_id or
+            not secrets.compare_digest(join_request["session_id"], request.session_id) or
+            join_request["status"] != "APPROVED"):
+        raise HTTPException(403, "An approved student session is required for classroom chat")
+    return "student", class_info, join_request
+
+
+@app.post("/api/class/{room_code}/chat")
+async def classroom_chat(room_code: str, request: ClassroomChatAction):
+    role, class_info, join_request = _authorize_chat_actor(room_code, request)
+    normalized = room_code.upper()
+    if request.action == "set_enabled":
+        if role != "teacher":
+            raise HTTPException(403, "Only the teacher can control classroom chat")
+        if request.enabled is None:
+            raise HTTPException(400, "Chat enabled state is required")
+        session_state.set_chat_enabled(normalized, request.enabled)
+    elif request.action == "send_message":
+        message = (request.text or "").strip()
+        if not message:
+            raise HTTPException(400, "Message cannot be empty")
+        if len(message) > 2000:
+            raise HTTPException(400, "Message is too long")
+        if not session_state.get_chat(normalized)["enabled"]:
+            raise HTTPException(403, "Chat is turned off by the teacher")
+        name = class_info["teacher_name"] if role == "teacher" else join_request["student_name"]
+        if not session_state.add_chat_message(normalized, name, message):
+            raise HTTPException(403, "Chat is turned off by the teacher")
+    chat = session_state.get_chat(normalized)
+    return chat
+
 @app.get("/api/class/{room_code}")
 async def get_class_info(room_code: str):
     c = session_state.get_class(room_code.upper())
@@ -370,6 +443,7 @@ async def get_class_info(room_code: str):
         "max_participants":          c["max_participants"],
         "student_microphone_policy": c["student_microphone_policy"].value,
         "student_camera_policy":     c["student_camera_policy"].value,
+        "meeting_passcode_required": c["meeting_passcode_hash"] is not None,
     }
 
 
@@ -479,13 +553,28 @@ async def unrestrict_student_microphone(request: StudentUnmuteRestrictionRequest
 
 
 @app.get("/api/class/{room_code}/microphone-restriction/{student_identity}")
-async def get_student_microphone_restriction(room_code: str, student_identity: str):
+async def get_student_microphone_restriction(
+    room_code: str, student_identity: str,
+    request_id: str = Query(...), session_id: str = Query(...),
+):
     c = session_state.get_class(room_code.upper())
     if not c or not session_state.is_class_active(room_code.upper()):
         raise HTTPException(404, "Class not found or has ended")
+    join_request = session_state.get_join_request(request_id)
+    if (not join_request or join_request["room_code"] != room_code.upper() or
+            join_request["student_identity"] != student_identity or
+            join_request["status"] != "APPROVED" or
+            not secrets.compare_digest(join_request["session_id"], session_id)):
+        raise HTTPException(403, "An approved student session is required")
     expired = session_state.expire_microphone_restriction(room_code.upper(), student_identity)
     if expired and session_state.get_microphone_policy(room_code.upper()) != MicrophonePolicy.LOCKED:
         await livekit_service.set_microphone_publish_permission(c["livekit_room_name"], student_identity, True)
+    elif (session_state.get_microphone_restriction(room_code.upper(), student_identity) and
+          not session_state.microphone_restriction_enforced(room_code.upper(), student_identity, session_id)):
+        # A student can reconnect while a restriction is active. Reassert the
+        # room permission after their new LiveKit participant is present.
+        await livekit_service.set_microphone_publish_permission(c["livekit_room_name"], student_identity, False)
+        session_state.mark_microphone_restriction_enforced(room_code.upper(), student_identity, session_id)
     return _serialize_microphone_restriction(
         session_state.get_microphone_restriction(room_code.upper(), student_identity))
 

@@ -1,8 +1,20 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import Script from 'next/script'
 import { api, JoinRequest } from '@/lib/api'
+
+declare global {
+  interface Window {
+    google?: {
+      accounts: { id: {
+        initialize: (options: { client_id: string; callback: (response: { credential: string }) => void; ux_mode?: 'popup' | 'redirect' }) => void
+        renderButton: (element: HTMLElement, options: { theme: 'outline'; size: 'large'; shape: 'rectangular'; text: 'continue_with'; width: number }) => void
+      } }
+    }
+  }
+}
 
 function getSessionId() {
   const key = 'class_join_session_id'
@@ -16,14 +28,19 @@ function getSessionId() {
 
 export default function StudentJoinForm({ inviteCode }: { inviteCode?: string }) {
   const router = useRouter()
-  const [studentName, setStudentName] = useState('')
   const [roomCode, setRoomCode] = useState('')
   const [meetingPasscode, setMeetingPasscode] = useState('')
   const [request, setRequest] = useState<JoinRequest | null>(null)
   const [sessionId, setSessionId] = useState('')
   const [className, setClassName] = useState('')
+  const [inviteInfoLoaded, setInviteInfoLoaded] = useState(!inviteCode)
+  const [passcodeRequired, setPasscodeRequired] = useState(true)
+  const [googleLoaded, setGoogleLoaded] = useState(false)
+  const [googleCredential, setGoogleCredential] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const googleButtonRef = useRef<HTMLDivElement>(null)
+  const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID
   const requestStorageKey = useMemo(() => `class_join_request_${inviteCode || roomCode.toUpperCase()}`, [inviteCode, roomCode])
 
   useEffect(() => {
@@ -33,9 +50,54 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
       api.getInviteInfo(inviteCode).then(info => {
         setRoomCode(info.room_code)
         setClassName(info.class_name)
+        setPasscodeRequired(info.meeting_passcode_required)
+        setInviteInfoLoaded(true)
       }).catch((err: Error) => setError(err.message || 'This class link is invalid or no longer available.'))
     }
   }, [inviteCode])
+
+  const createRequest = useCallback(async (credential: string, passcode: string) => {
+    if (!sessionId) return
+    setLoading(true); setError('')
+    try {
+      const result = await api.createJoinRequest({
+        google_credential: credential, meeting_passcode: passcode || undefined,
+        room_code: roomCode, invite_code: inviteCode, session_id: sessionId,
+      })
+      sessionStorage.setItem(requestStorageKey, result.request_id)
+      setRequest(result)
+      setGoogleCredential('')
+    } catch (err: any) {
+      setError(err.message || 'Unable to request entry to this class.')
+    } finally { setLoading(false) }
+  }, [inviteCode, requestStorageKey, roomCode, sessionId])
+
+  const handleGoogleCredential = useCallback((credential: string) => {
+    setGoogleCredential(credential)
+    setError('')
+    if (!passcodeRequired) void createRequest(credential, '')
+  }, [createRequest, passcodeRequired])
+
+  useEffect(() => {
+    const element = googleButtonRef.current
+    if (!googleLoaded || !googleClientId || !window.google || !element || !inviteInfoLoaded || !sessionId) return
+    element.replaceChildren()
+    window.google.accounts.id.initialize({
+      client_id: googleClientId,
+      callback: response => {
+        if (!response.credential) {
+          setError('Google sign-in did not complete. Please try again.')
+          return
+        }
+        handleGoogleCredential(response.credential)
+      },
+      ux_mode: 'popup',
+    })
+    window.google.accounts.id.renderButton(element, {
+      theme: 'outline', size: 'large', shape: 'rectangular', text: 'continue_with',
+      width: Math.max(220, Math.min(400, Math.floor(element.clientWidth || 320))),
+    })
+  }, [googleLoaded, googleClientId, handleGoogleCredential, inviteInfoLoaded, sessionId])
 
   useEffect(() => {
     if (!sessionId) return
@@ -67,6 +129,8 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
     let cancelled = false
     api.getApprovedJoinToken(request.request_id, sessionId).then(response => {
       if (cancelled) return
+      sessionStorage.setItem('approved_join_request_id', request.request_id)
+      sessionStorage.setItem('approved_join_session_id', sessionId)
       sessionStorage.setItem('livekit_token', response.token)
       sessionStorage.setItem('livekit_url', response.livekit_url)
       sessionStorage.setItem('room_code', response.room_code)
@@ -77,20 +141,10 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
     return () => { cancelled = true }
   }, [request, router, sessionId])
 
-  const submit = async (event: React.FormEvent) => {
+  const submitPasscode = async (event: React.FormEvent) => {
     event.preventDefault()
-    if (!sessionId) return
-    setLoading(true); setError('')
-    try {
-      const result = await api.createJoinRequest({
-        student_name: studentName, meeting_passcode: meetingPasscode,
-        room_code: roomCode, invite_code: inviteCode, session_id: sessionId,
-      })
-      sessionStorage.setItem(requestStorageKey, result.request_id)
-      setRequest(result)
-    } catch (err: any) {
-      setError(err.message || 'Unable to request entry to this class.')
-    } finally { setLoading(false) }
+    if (!googleCredential) { setError('Continue with Google before entering the meeting passcode.'); return }
+    await createRequest(googleCredential, meetingPasscode)
   }
 
   if (request?.status === 'REJECTED') {
@@ -108,15 +162,27 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
       <div className="max-w-md w-full bg-white rounded-lg shadow-xl p-5 sm:p-8">
         <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-2 text-center">Join a Class</h2>
         {className && <p className="text-center text-gray-600 mb-5 break-words">{className}</p>}
-        <form onSubmit={submit} className="space-y-4">
-          <Field label="Student Name" value={studentName} onChange={setStudentName} placeholder="Enter your name" />
-          {!inviteCode && <Field label="Room Code" value={roomCode} onChange={value => setRoomCode(value.toUpperCase())} placeholder="e.g., ABC123" />}
-          <Field label="Meeting Passcode" value={meetingPasscode} onChange={setMeetingPasscode} placeholder="Enter the meeting passcode" type="password" />
-          {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm break-words">{error}</div>}
-          <button type="submit" disabled={loading || !!error && !!inviteCode && !roomCode} className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:bg-green-400 text-white font-semibold rounded-lg shadow transition-colors">
-            {loading ? 'Requesting entry...' : 'Request to Join'}
-          </button>
-        </form>
+        {!googleCredential ? (
+          <div className="space-y-4">
+            {!inviteCode && <Field label="Room Code" value={roomCode} onChange={value => setRoomCode(value.toUpperCase())} placeholder="e.g., ABC123" />}
+            {googleClientId && inviteInfoLoaded && sessionId ? <>
+              <p className="text-center text-sm text-gray-600">Sign in to identify yourself to the teacher.</p>
+              <div ref={googleButtonRef} className="flex min-h-10 w-full justify-center" />
+              <p className="text-center text-xs text-gray-500">If you close the Google sign-in window, you can try again.</p>
+              <Script src="https://accounts.google.com/gsi/client" strategy="afterInteractive" onLoad={() => setGoogleLoaded(true)} onError={() => setError('Google sign-in could not load. Check your connection and try again.')} />
+              {googleLoaded && !window.google && <p className="text-sm text-red-700">Google sign-in is unavailable in this browser.</p>}
+            </> : !googleClientId ? <p className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Google sign-in is not configured for this site.</p> : <p className="text-center text-sm text-gray-600">Loading class details…</p>}
+            {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm break-words">{error}</div>}
+            {loading && <p className="text-center text-sm text-gray-600">Sending your request…</p>}
+          </div>
+        ) : passcodeRequired ? (
+          <form onSubmit={submitPasscode} className="space-y-4">
+            <p className="rounded-md bg-green-50 p-3 text-sm text-green-800">Google sign-in complete. Enter the meeting password to request entry.</p>
+            <Field label="Meeting Passcode" value={meetingPasscode} onChange={setMeetingPasscode} placeholder="Enter the meeting passcode" type="password" />
+            {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm break-words">{error}</div>}
+            <button type="submit" disabled={loading} className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:bg-green-400 text-white font-semibold rounded-lg shadow transition-colors">{loading ? 'Requesting entry...' : 'Continue to Waiting Room'}</button>
+          </form>
+        ) : null}
         <button onClick={() => router.push('/')} className="w-full mt-4 py-3 sm:py-2 text-gray-600 hover:text-gray-800">Back to Home</button>
       </div>
     </main>

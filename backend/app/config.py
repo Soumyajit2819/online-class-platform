@@ -10,6 +10,9 @@ class Settings:
     LIVEKIT_API_KEY: str    = os.getenv("LIVEKIT_API_KEY", "")
     LIVEKIT_API_SECRET: str = os.getenv("LIVEKIT_API_SECRET", "")
 
+    # Google Identity Services Web OAuth client ID (public identifier, not a secret).
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+
     # Frontend URL (single or comma-separated list for multiple origins)
     # e.g. "http://localhost:3000,https://your-app.vercel.app"
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")

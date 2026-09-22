@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from httpx import AsyncClient, ASGITransport
-from app.main import app, _remux_hls_to_mp4, _safe_download_filename
+from app.main import app, _remux_hls_to_mp4, _safe_download_filename, verify_google_credential
+from app.main import google_id_token
 from app.livekit_service import session_state, livekit_service
 from app.config import settings
 
@@ -19,6 +20,20 @@ from app.config import settings
 
 async def get_client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture(autouse=True)
+def mock_verified_google_identity(monkeypatch):
+    monkeypatch.setattr("app.main.verify_google_credential", lambda _credential: {
+        "sub": "test-google-sub", "name": "Alice Google",
+    })
+
+
+def register_approved_identity(room_code, identity):
+    session_id = f"approved-session-for-{room_code}-long"
+    request = session_state.create_join_request(room_code, "Approved Student", session_id, identity)
+    session_state.decide_join_request(request["request_id"], "APPROVED")
+    return request["request_id"], session_id
 
 
 class TestRecordingPlaybackTokens:
@@ -314,6 +329,61 @@ class TestJoinRoom:
 
 
 class TestWaitingRoom:
+    def test_valid_google_identity_uses_configured_audience(self, monkeypatch):
+        previous = settings.GOOGLE_CLIENT_ID
+        settings.GOOGLE_CLIENT_ID = "student-web-client.apps.googleusercontent.com"
+        try:
+            with patch("app.main.google_id_token.verify_oauth2_token", return_value={
+                "sub": "stable-google-sub", "name": "Verified Name", "aud": settings.GOOGLE_CLIENT_ID,
+            }) as verify:
+                identity = verify_google_credential("opaque-id-token")
+            assert identity == {"sub": "stable-google-sub", "name": "Verified Name"}
+            assert verify.call_args.kwargs["audience"] == settings.GOOGLE_CLIENT_ID
+        finally:
+            settings.GOOGLE_CLIENT_ID = previous
+
+    def test_invalid_google_token_is_rejected(self):
+        previous = settings.GOOGLE_CLIENT_ID
+        settings.GOOGLE_CLIENT_ID = "expected-web-client-id"
+        try:
+            with patch("app.main.google_id_token.verify_oauth2_token", side_effect=ValueError("invalid signature")) as verify:
+                with pytest.raises(Exception) as exc:
+                    verify_google_credential("invalid-id-token")
+            assert getattr(exc.value, "status_code", None) == 401
+            assert verify.call_args.kwargs["audience"] == "expected-web-client-id"
+        finally:
+            settings.GOOGLE_CLIENT_ID = previous
+
+    def test_wrong_google_token_audience_is_rejected(self):
+        previous = settings.GOOGLE_CLIENT_ID
+        settings.GOOGLE_CLIENT_ID = "expected-web-client-id"
+        try:
+            with patch("app.main.google_id_token.verify_oauth2_token", return_value={
+                "aud": "different-web-client-id", "sub": "subject", "name": "Student",
+            }):
+                with pytest.raises(Exception) as exc:
+                    verify_google_credential("wrong-audience-token")
+            assert getattr(exc.value, "status_code", None) == 401
+        finally:
+            settings.GOOGLE_CLIENT_ID = previous
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_password_protected_class_rejects_bad_password_before_waiting(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Protected Class", "meeting_passcode": "right-pass",
+            })
+            room_code = created.json()["room_code"]
+            session_id = "w" * 36
+            rejected = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "meeting_passcode": "wrong-pass", "session_id": session_id,
+            })
+        assert rejected.status_code == 403
+        assert session_state.get_join_request_for_session(room_code, session_id) is None
+
     @pytest.mark.asyncio
     @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
     @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock)
@@ -328,11 +398,15 @@ class TestWaitingRoom:
             invite_code = created.json()["invite_code"]
             session_id = "a" * 36
             pending = await c.post("/api/student/join-requests", json={
-                "student_name": "Alice", "invite_code": invite_code,
+                "google_credential": "mock-google-id-token", "student_name": "untrusted browser name", "invite_code": invite_code,
                 "meeting_passcode": "join123", "session_id": session_id,
             })
             assert pending.status_code == 200
+            assert pending.json()["student_name"] == "Alice Google"
+            assert "google_credential" not in pending.json()
+            assert "student_identity" not in pending.json()
             request_id = pending.json()["request_id"]
+            assert session_state.get_join_request(request_id)["student_identity"] == "google_test-google-sub"
             denied = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
             assert denied.status_code == 403
             teacher_identity = session_state.get_class(room_code)["teacher_identity"]
@@ -346,6 +420,122 @@ class TestWaitingRoom:
             assert token.status_code == 200
             assert "token" in token.json()
 
+
+class TestClassroomChat:
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_teacher_chat_can_toggle_off_and_on_and_server_rejects_student_sends(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Chat Test",
+            })
+            room_code = created.json()["room_code"]
+            teacher = {
+                "teacher_identity": session_state.get_class(room_code)["teacher_identity"],
+                "teacher_access_key": created.json()["teacher_access_key"],
+            }
+            session_id = "chat-student-session-0001"
+            pending = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "session_id": session_id,
+            })
+            request_id = pending.json()["request_id"]
+            await c.post("/api/teacher/approve-join-request", json={
+                "room_code": room_code, **teacher, "request_id": request_id,
+            })
+            student = {"join_request_id": request_id, "session_id": session_id}
+
+            first = await c.post(f"/api/class/{room_code}/chat", json={
+                **student, "action": "send_message", "text": "Before pause",
+            })
+            assert first.status_code == 200
+            assert len(first.json()["messages"]) == 1
+
+            off = await c.post(f"/api/class/{room_code}/chat", json={
+                **teacher, "action": "set_enabled", "enabled": False,
+            })
+            assert off.status_code == 200 and off.json()["enabled"] is False
+            blocked_send = await c.post(f"/api/class/{room_code}/chat", json={
+                **student, "action": "send_message", "text": "Draft remains local",
+            })
+            assert blocked_send.status_code == 403
+            snapshot = await c.post(f"/api/class/{room_code}/chat", json={
+                **student, "action": "snapshot",
+            })
+            assert snapshot.json()["enabled"] is False
+            assert [item["text"] for item in snapshot.json()["messages"]] == ["Before pause"]
+
+            on = await c.post(f"/api/class/{room_code}/chat", json={
+                **teacher, "action": "set_enabled", "enabled": True,
+            })
+            assert on.status_code == 200 and on.json()["enabled"] is True
+            resumed = await c.post(f"/api/class/{room_code}/chat", json={
+                **student, "action": "send_message", "text": "After resume",
+            })
+            assert resumed.status_code == 200
+            assert [item["text"] for item in resumed.json()["messages"]] == ["Before pause", "After resume"]
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_student_cannot_change_teacher_chat_state(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Chat Authorization",
+            })
+            room_code = created.json()["room_code"]
+            session_id = "chat-student-session-0002"
+            pending = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "session_id": session_id,
+            })
+            request_id = pending.json()["request_id"]
+            await c.post("/api/teacher/approve-join-request", json={
+                "room_code": room_code,
+                "teacher_identity": session_state.get_class(room_code)["teacher_identity"],
+                "teacher_access_key": created.json()["teacher_access_key"],
+                "request_id": request_id,
+            })
+            response = await c.post(f"/api/class/{room_code}/chat", json={
+                "join_request_id": request_id, "session_id": session_id,
+                "action": "set_enabled", "enabled": False,
+            })
+            assert response.status_code == 403
+            assert session_state.get_chat(room_code)["enabled"] is True
+
+
+class TestTimedMicrophoneTokenPermissions:
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_access_token", return_value="student-token")
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock, return_value=[])
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_timed_mute_keeps_mic_capability_for_expiry_restoration(self, mock_room, _participants, create_token):
+        mock_room.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Timed Mic",
+            })
+            room_code = created.json()["room_code"]
+            session_id = "timed-mic-student-session-01"
+            pending = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "session_id": session_id,
+            })
+            request_id = pending.json()["request_id"]
+            await c.post("/api/teacher/approve-join-request", json={
+                "room_code": room_code,
+                "teacher_identity": session_state.get_class(room_code)["teacher_identity"],
+                "teacher_access_key": created.json()["teacher_access_key"],
+                "request_id": request_id,
+            })
+            identity = session_state.get_join_request(request_id)["student_identity"]
+            session_state.set_microphone_restriction(room_code, identity, 1)
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+        assert token.status_code == 200
+        assert create_token.call_args.kwargs["is_muted"] is True
+        assert "microphone" in create_token.call_args.kwargs["can_publish_sources"]
+
     @pytest.mark.asyncio
     @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
     async def test_rejected_request_cannot_be_recreated_or_tokenized(self, mock_create):
@@ -357,7 +547,7 @@ class TestWaitingRoom:
             room_code = created.json()["room_code"]
             session_id = "b" * 36
             pending = await c.post("/api/student/join-requests", json={
-                "student_name": "Alice", "room_code": room_code,
+                "google_credential": "mock-google-id-token", "room_code": room_code,
                 "meeting_passcode": "join123", "session_id": session_id,
             })
             request_id = pending.json()["request_id"]
@@ -369,10 +559,41 @@ class TestWaitingRoom:
             })
             assert rejected.status_code == 200
             repeated = await c.post("/api/student/join-requests", json={
-                "student_name": "Alice", "room_code": room_code,
+                "google_credential": "mock-google-id-token", "room_code": room_code,
                 "meeting_passcode": "join123", "session_id": session_id,
             })
             assert repeated.status_code == 403
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+            assert token.status_code == 403
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    @patch("app.main.livekit_service.get_participants", new_callable=AsyncMock, return_value=[])
+    async def test_passwordless_class_still_requires_teacher_approval(self, _participants, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Passwordless Class",
+            })
+            room_code = created.json()["room_code"]
+            session_id = "p" * 36
+            pending = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "session_id": session_id,
+            })
+            assert pending.status_code == 200
+            request_id = pending.json()["request_id"]
+            denied = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+            assert denied.status_code == 403
+            approved = await c.post("/api/teacher/approve-join-request", json={
+                "room_code": room_code,
+                "teacher_identity": session_state.get_class(room_code)["teacher_identity"],
+                "teacher_access_key": created.json()["teacher_access_key"],
+                "request_id": request_id,
+            })
+            assert approved.status_code == 200
+            token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
+            assert token.status_code == 200
 
 
 class TestMicrophoneRestrictions:
@@ -418,12 +639,21 @@ class TestMicrophoneRestrictions:
             restricted = await c.post("/api/teacher/restrict-student-microphone", json={"room_code": room_code, "teacher_identity": teacher_identity, "target_identity": "student_1"})
             assert restricted.status_code == 200
             assert restricted.json()["mode"] == "UNTIL_TEACHER"
-            status = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1")
+            request_id, session_id = register_approved_identity(room_code, "student_1")
+            unauthorized = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1", params={"request_id": request_id, "session_id": "wrong-session-id-000000"})
+            assert unauthorized.status_code == 403
+            status = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1", params={"request_id": request_id, "session_id": session_id})
             assert status.json()["restricted"] is True
             released = await c.post("/api/teacher/unrestrict-student-microphone", json={"room_code": room_code, "teacher_identity": teacher_identity, "target_identity": "student_1"})
         assert released.status_code == 200
         assert session_state.get_microphone_restriction(room_code, "student_1") is None
-        assert mock_permission.await_count == 2
+        assert mock_permission.await_count == 3
+        room_name = session_state.get_class(room_code)["livekit_room_name"]
+        assert mock_permission.await_args_list == [
+            ((room_name, "student_1", False),),
+            ((room_name, "student_1", False),),
+            ((room_name, "student_1", True),),
+        ]
 
     @pytest.mark.asyncio
     @patch("app.main.livekit_service.set_microphone_publish_permission", new_callable=AsyncMock)
@@ -433,9 +663,10 @@ class TestMicrophoneRestrictions:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             created = await c.post("/api/teacher/create-room", json={"teacher_name": "John", "room_name": "Math", "meeting_passcode": "abc123"})
             room_code = created.json()["room_code"]
+            request_id, session_id = register_approved_identity(room_code, "student_1")
             restriction = session_state.set_microphone_restriction(room_code, "student_1", 1)
             restriction["expires_at"] = restriction["expires_at"] - timedelta(minutes=2)
-            status = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1")
+            status = await c.get(f"/api/class/{room_code}/microphone-restriction/student_1", params={"request_id": request_id, "session_id": session_id})
         assert status.status_code == 200
         assert status.json()["restricted"] is False
         mock_permission.assert_awaited_once()
@@ -507,7 +738,7 @@ class TestMicrophoneRestrictions:
     @staticmethod
     async def _approved_student(client, room_code, teacher_identity, teacher_access_key, session_id="z" * 36):
         pending = await client.post("/api/student/join-requests", json={
-            "student_name": "Alice", "room_code": room_code,
+            "google_credential": "mock-google-id-token", "room_code": room_code,
             "meeting_passcode": "abc123", "session_id": session_id,
         })
         request_id = pending.json()["request_id"]
@@ -534,7 +765,7 @@ class TestMicrophoneRestrictions:
             session_state.set_microphone_restriction(room_code, student_identity, 1)
             token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
         assert token.status_code == 200
-        assert mock_token.call_args.kwargs["can_publish_sources"] == ["screen_share", "screen_share_audio", "camera"]
+        assert mock_token.call_args.kwargs["can_publish_sources"] == ["screen_share", "screen_share_audio", "microphone", "camera"]
         assert mock_token.call_args.kwargs["is_muted"] is True
 
     @pytest.mark.asyncio
@@ -574,7 +805,8 @@ class TestMicrophoneRestrictions:
             session_state.set_microphone_restriction(room_code, student_identity, None)
             token = await c.post(f"/api/student/join-requests/{request_id}/token", json={"session_id": session_id})
         assert token.status_code == 200
-        assert "microphone" not in mock_token.call_args.kwargs["can_publish_sources"]
+        assert "microphone" in mock_token.call_args.kwargs["can_publish_sources"]
+        assert mock_token.call_args.kwargs["is_muted"] is True
 
     @pytest.mark.asyncio
     @patch("app.main.livekit_service.create_access_token", return_value="student-token")

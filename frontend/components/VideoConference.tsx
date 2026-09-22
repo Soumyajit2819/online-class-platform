@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -12,8 +12,8 @@ import {
   useLocalParticipant,
 } from '@livekit/components-react'
 import '@livekit/components-styles'
-import { Track, RoomEvent, Participant, Room } from 'livekit-client'
-import { api, Participant as ApiParticipant, JoinRequest, MicrophoneRestriction } from '@/lib/api'
+import { Track, RoomEvent, Participant } from 'livekit-client'
+import { api, Participant as ApiParticipant, JoinRequest, MicrophoneRestriction, ClassroomChatAction, ClassroomChatMessage } from '@/lib/api'
 
 interface VideoConferenceProps {
   token: string
@@ -36,7 +36,8 @@ export default function VideoConferenceComponent({
 
   return (
     <LiveKitRoom
-      video={true}
+      // Camera must start off for every role; the user enables it from controls.
+      video={false}
       // Students always begin with their microphone off. Authorization to
       // publish remains server-side and the control bar enables it manually.
       audio={isTeacher}
@@ -45,7 +46,7 @@ export default function VideoConferenceComponent({
       connect={true}
       onError={(error) => {
         console.error('LiveKit error:', error)
-        setError('Failed to connect to the classroom. Please try again.')
+        setError(`LiveKit connection failed: ${error.message || 'Please try again.'}`)
       }}
       className="min-h-screen lg:h-screen flex flex-col"
     >
@@ -54,6 +55,7 @@ export default function VideoConferenceComponent({
         roomName={roomName}
         isTeacher={isTeacher}
         teacherAccessKey={teacherAccessKey}
+        roomError={error}
       />
     </LiveKitRoom>
   )
@@ -64,11 +66,13 @@ function ClassroomContent({
   roomName,
   isTeacher,
   teacherAccessKey,
+  roomError,
 }: {
   roomCode: string
   roomName: string
   isTeacher: boolean
   teacherAccessKey: string
+  roomError: string | null
 }) {
   const room = useRoomContext()
   const participants = useParticipants()
@@ -84,14 +88,25 @@ function ClassroomContent({
   const [participantsList, setParticipantsList] = useState<ApiParticipant[]>([])
   const [microphoneRestrictions, setMicrophoneRestrictions] = useState<Record<string, MicrophoneRestriction>>({})
   const [myMicrophoneRestriction, setMyMicrophoneRestriction] = useState<MicrophoneRestriction | null>(null)
+  const [, setRestrictionTick] = useState(0)
   const [isLocked, setIsLocked] = useState(false)
   const [isEnded, setIsEnded] = useState(false)
   const [micPolicy, setMicPolicy] = useState<'allowed' | 'muted_by_default' | 'locked'>('allowed')
   const [cameraPolicy, setCameraPolicy] = useState<'allowed' | 'off_by_default' | 'locked'>('allowed')
   const [isRecording, setIsRecording] = useState(false)
   const [activeRecordingId, setActiveRecordingId] = useState<string | null>(null)
+  const [deviceError, setDeviceError] = useState('')
 
   const teacherIdentity = localParticipant.localParticipant?.identity || ''
+  const microphoneRestrictionActive = !!myMicrophoneRestriction?.restricted && (
+    myMicrophoneRestriction.mode !== 'TIMED' || remainingRestrictionSeconds(myMicrophoneRestriction) > 0
+  )
+
+  useEffect(() => {
+    if (!myMicrophoneRestriction?.restricted || myMicrophoneRestriction.mode !== 'TIMED') return
+    const timer = window.setInterval(() => setRestrictionTick(value => value + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [myMicrophoneRestriction])
 
   // Fetch participants from API
   const fetchParticipants = useCallback(async () => {
@@ -107,10 +122,13 @@ function ClassroomContent({
   useEffect(() => {
     const identity = localParticipant.localParticipant?.identity
     if (isTeacher || !identity) return
+    const requestId = sessionStorage.getItem('approved_join_request_id')
+    const joinSessionId = sessionStorage.getItem('approved_join_session_id')
+    if (!requestId || !joinSessionId) return
     let active = true
     const fetchRestriction = async () => {
       try {
-        const restriction = await api.getStudentMicrophoneRestriction(roomCode, identity)
+        const restriction = await api.getStudentMicrophoneRestriction(roomCode, identity, requestId, joinSessionId)
         if (!active) return
         setMyMicrophoneRestriction(restriction)
         if (restriction.restricted) await localParticipant.localParticipant?.setMicrophoneEnabled(false)
@@ -188,6 +206,7 @@ function ClassroomContent({
     // Mobile/tablet: vertical stack (header → video → controls → sidebar), page scrolls.
     // Desktop (lg+): grid with header on top, video + sidebar in the middle, controls at the bottom.
     <div className="min-h-screen lg:h-screen flex flex-col lg:grid lg:grid-cols-[minmax(0,1fr)_20rem] lg:grid-rows-[auto_minmax(0,1fr)_auto] bg-gray-900 overflow-x-hidden lg:overflow-visible">
+      {(roomError || deviceError) && <div role="alert" className="shrink-0 border-b border-red-700 bg-red-950 px-4 py-2 text-sm text-red-100 lg:col-span-full">{deviceError || roomError}<button type="button" onClick={() => { setDeviceError('') }} className="ml-3 underline">Dismiss</button></div>}
       {/* Header */}
       <div className="shrink-0 bg-gray-800 border-b border-gray-700 px-3 sm:px-4 py-2 sm:py-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-4 lg:col-span-full lg:row-start-1">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 sm:gap-x-4 min-w-0">
@@ -211,27 +230,33 @@ function ClassroomContent({
       {/* The custom layout intentionally does not use GridLayout pagination.
           Its fixed-height mobile container can otherwise make later pages
           inaccessible. Every LiveKit track remains mounted in this scrollable grid. */}
-      <div className="shrink-0 min-w-0 overflow-hidden p-2 sm:p-4 h-[50vh] min-h-[240px] sm:h-[55vh] lg:h-auto lg:min-h-0 lg:shrink lg:col-start-1 lg:row-start-2">
+      <div className="shrink-0 min-w-0 overflow-hidden p-2 sm:p-4 h-[calc(100dvh-13rem)] min-h-[300px] sm:h-[calc(100dvh-14rem)] lg:h-auto lg:min-h-0 lg:shrink lg:col-start-1 lg:row-start-2">
         <ParticipantVideoLayout tracks={tracks} />
       </div>
 
       {/* Control bar */}
       <div className="shrink-0 bg-gray-800 border-t border-gray-700 lg:col-span-full lg:row-start-3">
-        {!isTeacher && myMicrophoneRestriction?.restricted && (
+        {!isTeacher && microphoneRestrictionActive && (
           <MicrophoneRestrictionNotice restriction={myMicrophoneRestriction} />
         )}
         <div className="[&_.lk-control-bar]:flex-wrap [&_.lk-control-bar]:justify-center">
           <ControlBar
             variation="verbose"
+            onDeviceError={({ source, error }) => {
+              const device = source === Track.Source.Microphone ? 'Microphone' : source === Track.Source.Camera ? 'Camera' : 'Media device'
+              setDeviceError(`${device} could not be started: ${error.message || 'check browser permission and device availability'}`)
+              console.error(`${device} error`, error)
+            }}
             controls={{
               camera: !isTeacher && cameraPolicy === 'locked' ? false : true,
-              microphone: !isTeacher && (micPolicy === 'locked' || myMicrophoneRestriction?.restricted) ? false : true,
+              microphone: !isTeacher && (micPolicy === 'locked' || microphoneRestrictionActive) ? false : true,
               screenShare: true,
               leave: true,
               chat: false,
             }}
           />
         </div>
+        <DeviceSelectors onError={setDeviceError} />
         {!isTeacher && (
           <div className="text-center py-2 px-4">
             <button
@@ -247,6 +272,7 @@ function ClassroomContent({
       {/* Sidebar - Teacher controls or participant list
           Below the controls on mobile/tablet, beside the video on desktop */}
       <div className="flex-1 flex flex-col bg-gray-800 border-t border-gray-700 lg:border-t-0 lg:border-l lg:min-h-0 lg:overflow-hidden lg:col-start-2 lg:row-start-2">
+        <ClassChat roomCode={roomCode} isTeacher={isTeacher} teacherIdentity={teacherIdentity} teacherAccessKey={teacherAccessKey} />
         {isTeacher ? (
           <TeacherControls
             roomCode={roomCode}
@@ -285,6 +311,197 @@ function ClassroomContent({
 
 type VideoTrackReference = ReturnType<typeof useTracks>
 
+type SelectableDevice = { deviceId: string; label: string }
+
+function DeviceSelectors({ onError }: { onError: (message: string) => void }) {
+  const room = useRoomContext()
+  const [cameras, setCameras] = useState<SelectableDevice[]>([])
+  const [microphones, setMicrophones] = useState<SelectableDevice[]>([])
+  const [outputs, setOutputs] = useState<SelectableDevice[]>([])
+  const [selected, setSelected] = useState<Record<string, string>>({})
+  const [scanError, setScanError] = useState('')
+  const [switching, setSwitching] = useState(false)
+  const outputSupported = typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype
+
+  const refresh = useCallback(async () => {
+    try {
+      const found = await navigator.mediaDevices.enumerateDevices()
+      const collect = (kind: MediaDeviceKind, fallback: string) => found
+        .filter(device => device.kind === kind)
+        .map((device, index) => ({ deviceId: device.deviceId, label: device.label || `${fallback} ${index + 1}` }))
+      const cameraList = collect('videoinput', 'Camera')
+      const microphoneList = collect('audioinput', 'Microphone')
+      const outputList = collect('audiooutput', 'Audio output')
+      setCameras(cameraList); setMicrophones(microphoneList); setOutputs(outputList)
+      setSelected({
+        videoinput: room.getActiveDevice('videoinput') || cameraList.find(device => device.deviceId === 'default')?.deviceId || cameraList[0]?.deviceId || '',
+        audioinput: room.getActiveDevice('audioinput') || microphoneList.find(device => device.deviceId === 'default')?.deviceId || microphoneList[0]?.deviceId || '',
+        audiooutput: room.getActiveDevice('audiooutput') || outputList.find(device => device.deviceId === 'default')?.deviceId || outputList[0]?.deviceId || '',
+      })
+      setScanError('')
+    } catch (err: any) {
+      setScanError(err.message || 'Could not read available media devices.')
+    }
+  }, [room])
+
+  useEffect(() => {
+    void refresh()
+    const mediaDevices = navigator.mediaDevices
+    mediaDevices?.addEventListener('devicechange', refresh)
+    room.on(RoomEvent.LocalTrackPublished, refresh)
+    room.on(RoomEvent.LocalTrackUnpublished, refresh)
+    room.on(RoomEvent.ActiveDeviceChanged, refresh)
+    return () => {
+      mediaDevices?.removeEventListener('devicechange', refresh)
+      room.off(RoomEvent.LocalTrackPublished, refresh)
+      room.off(RoomEvent.LocalTrackUnpublished, refresh)
+      room.off(RoomEvent.ActiveDeviceChanged, refresh)
+    }
+  }, [room, refresh])
+
+  const switchDevice = async (kind: MediaDeviceKind, deviceId: string, label: string) => {
+    if (!deviceId) return
+    setSwitching(true); onError('')
+    try {
+      const changed = await room.switchActiveDevice(kind, deviceId)
+      if (!changed) throw new Error(`The browser could not switch to ${label}.`)
+      setSelected(current => ({ ...current, [kind]: deviceId }))
+      await refresh()
+    } catch (err: any) {
+      onError(`${label} could not be selected: ${err.message || 'device switching failed'}`)
+      await refresh()
+    } finally { setSwitching(false) }
+  }
+
+  const selector = (label: string, kind: MediaDeviceKind, devices: SelectableDevice[], supported = true) => (
+    <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs text-gray-300">
+      <span>{label}</span>
+      <select
+        value={selected[kind] || ''}
+        disabled={!supported || devices.length === 0 || switching}
+        onChange={event => void switchDevice(kind, event.target.value, label.toLowerCase())}
+        className="min-w-0 w-full rounded-md border border-gray-600 bg-gray-700 px-2 py-2 text-sm text-white disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {devices.length ? devices.map(device => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>) : <option value="">{supported ? `No ${label.toLowerCase()} devices reported` : 'Not supported by this browser'}</option>}
+      </select>
+    </label>
+  )
+
+  return <div className="border-t border-gray-700 bg-gray-800 px-3 py-2 sm:px-4">
+    <div className="mb-2 flex items-center justify-between gap-2">
+      <span className="text-xs font-medium text-gray-300">Devices</span>
+      <button type="button" onClick={() => void refresh()} className="text-xs text-blue-300 underline hover:text-blue-200">Refresh device list</button>
+    </div>
+    <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
+      {selector('Camera', 'videoinput', cameras)}
+      {selector('Microphone input', 'audioinput', microphones)}
+      {outputSupported ? selector('Speaker / audio output', 'audiooutput', outputs) : <p className="self-end pb-2 text-xs text-gray-400">Speaker selection is not supported by this browser.</p>}
+    </div>
+    {scanError && <p className="mt-1 text-xs text-amber-300">{scanError}</p>}
+  </div>
+}
+
+function ClassChat({ roomCode, isTeacher, teacherIdentity, teacherAccessKey }: {
+  roomCode: string; isTeacher: boolean; teacherIdentity: string; teacherAccessKey: string
+}) {
+  const [messages, setMessages] = useState<ClassroomChatMessage[]>([])
+  const [draft, setDraft] = useState('')
+  const [open, setOpen] = useState(false)
+  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [authReady, setAuthReady] = useState(false)
+  const busyRef = useRef(false)
+  const actorRef = useRef<Omit<ClassroomChatAction, 'action'> | null>(null)
+
+  useEffect(() => {
+    if (isTeacher) {
+      actorRef.current = { teacher_identity: teacherIdentity, teacher_access_key: teacherAccessKey }
+    } else {
+      actorRef.current = {
+        join_request_id: sessionStorage.getItem('approved_join_request_id') || undefined,
+        session_id: sessionStorage.getItem('approved_join_session_id') || undefined,
+      }
+    }
+    setAuthReady(!!(actorRef.current.teacher_identity && actorRef.current.teacher_access_key) ||
+      !!(actorRef.current.join_request_id && actorRef.current.session_id))
+  }, [isTeacher, teacherIdentity, teacherAccessKey])
+
+  const synchronize = useCallback(async () => {
+    const actor = actorRef.current
+    if (!actor || busyRef.current) return
+    try {
+      const snapshot = await api.classroomChat(roomCode, { ...actor, action: 'snapshot' })
+      if (busyRef.current) return
+      setEnabled(snapshot.enabled)
+      setMessages(snapshot.messages)
+      setError('')
+    } catch (err: any) {
+      if (!busyRef.current) setError(err.message || 'Unable to load classroom chat.')
+    }
+  }, [roomCode])
+
+  useEffect(() => {
+    if (!authReady) return
+    void synchronize()
+    const timer = window.setInterval(() => void synchronize(), 1500)
+    return () => window.clearInterval(timer)
+  }, [authReady, synchronize])
+
+  const runAction = async (action: ClassroomChatAction) => {
+    const actor = actorRef.current
+    if (!actor || busyRef.current) return
+    busyRef.current = true
+    setBusy(true)
+    setError('')
+    try {
+      const result = await api.classroomChat(roomCode, { ...actor, ...action })
+      setEnabled(result.enabled)
+      setMessages(result.messages)
+      return true
+    } catch (err: any) {
+      setError(err.message || 'Unable to update classroom chat.')
+      return false
+    } finally {
+      busyRef.current = false
+      setBusy(false)
+      window.setTimeout(() => void synchronize(), 0)
+    }
+  }
+
+  const toggle = async () => {
+    if (enabled === null) return
+    await runAction({ action: 'set_enabled', enabled: !enabled })
+  }
+  const send = async (event: React.FormEvent) => {
+    event.preventDefault()
+    const text = draft.trim()
+    if (!text || enabled !== true) return
+    const success = await runAction({ action: 'send_message', text })
+    if (success) setDraft('')
+  }
+
+  return <section className="shrink-0 border-b border-gray-700 p-3 sm:p-4">
+    <div className="flex items-center justify-between gap-2">
+      <button onClick={() => setOpen(value => !value)} className="font-semibold text-white" aria-expanded={open}>Class Chat {open ? '⌄' : '›'}</button>
+      {isTeacher && <button onClick={toggle} disabled={busy || enabled === null || !authReady} className={`rounded-md border px-3 py-1 text-sm disabled:cursor-wait disabled:opacity-60 ${enabled ? 'border-emerald-500 bg-emerald-900 text-emerald-100' : 'border-gray-500 bg-gray-700 text-white'}`}>Chat: {enabled === null ? '…' : enabled ? 'ON' : 'OFF'}</button>}
+    </div>
+    {open && <>
+      <div className="mt-3 h-40 overflow-y-auto rounded-md border border-gray-700 bg-gray-900 p-2 text-sm" aria-live="polite">
+        {messages.length ? messages.map(message => <p key={message.id} className="mb-2 break-words text-gray-100"><span className="font-semibold text-blue-300">{message.name}: </span>{message.text}</p>) : <p className="text-gray-400">No messages yet.</p>}
+      </div>
+      <form onSubmit={send} className="mt-2 flex min-w-0 gap-2">
+        <input value={draft} onChange={event => setDraft(event.target.value)} placeholder="Message the class" className="min-w-0 flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white placeholder:text-gray-400 focus:border-blue-400 focus:outline-none" />
+        <button type="button" onClick={() => setDraft(value => `${value} 😊`)} aria-label="Add emoji" className="rounded-md border border-gray-600 bg-gray-700 px-2 text-lg text-white hover:bg-gray-600">😊</button>
+        <button type="submit" disabled={busy || enabled !== true || !draft.trim()} className="rounded-md border border-gray-600 bg-blue-600 px-3 text-sm font-medium text-white hover:bg-blue-500 disabled:border-gray-600 disabled:bg-gray-100 disabled:text-gray-400">Send</button>
+      </form>
+      {error && <p className="mt-2 text-xs text-red-300">{error}</p>}
+      {enabled === false && <p className="mt-1 text-xs text-gray-300">Chat is paused. You can still view messages and type a draft.</p>}
+      {!authReady && <p className="mt-2 text-xs text-red-300">Chat session could not be verified. Rejoin through the class link.</p>}
+    </>}
+  </section>
+}
+
 function trackId(track: VideoTrackReference[number]) {
   return `${track.participant.identity}:${track.source}`
 }
@@ -305,7 +522,7 @@ function ParticipantVideoLayout({ tracks }: { tracks: VideoTrackReference }) {
     const id = trackId(track)
     const isPinned = id === pinnedTrackId
     return (
-      <div key={id} className={`relative min-w-0 aspect-video ${prominent ? 'h-full' : ''}`}>
+      <div key={id} className={`relative min-w-0 min-h-0 ${prominent ? 'h-full' : 'aspect-video'}`}>
         <ParticipantTile trackRef={track} className="h-full w-full rounded-lg overflow-hidden" />
         <button
           type="button"
@@ -326,7 +543,7 @@ function ParticipantVideoLayout({ tracks }: { tracks: VideoTrackReference }) {
         <div className="min-h-0 flex-1">{renderTile(pinnedTrack, true)}</div>
         {otherTracks.length > 0 && (
           <div className="max-h-[42%] shrink-0 overflow-y-auto overscroll-contain pr-1">
-            <div className="grid grid-cols-1 min-[380px]:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2 auto-rows-[calc((100dvh-16rem)/3)] md:auto-rows-auto">
               {otherTracks.map((track) => renderTile(track))}
             </div>
           </div>
@@ -337,7 +554,7 @@ function ParticipantVideoLayout({ tracks }: { tracks: VideoTrackReference }) {
 
   return (
     <div className="h-full overflow-y-auto overscroll-contain pr-1">
-      <div className="grid grid-cols-1 min-[380px]:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2">
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-2 auto-rows-[calc((100dvh-16rem)/3)] md:auto-rows-auto">
         {tracks.map((track) => renderTile(track))}
       </div>
     </div>
