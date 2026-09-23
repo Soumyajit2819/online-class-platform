@@ -739,16 +739,23 @@ function TeacherControls({
     try {
       // Stop recording if active
       if (isRecording && activeRecordingId) {
-        await api.stopRecording({
-          room_code: roomCode,
-          recording_id: activeRecordingId,
-          teacher_identity: teacherIdentity,
-        })
+        try {
+          await api.stopRecording({
+            room_code: roomCode,
+            recording_id: activeRecordingId,
+            teacher_identity: teacherIdentity,
+          })
+        } catch (stopError) {
+          // A stop RPC failure must not prevent ending the LiveKit room. The
+          // backend keeps the recording pending for reconciliation.
+          console.warn('Recording stop did not complete before class teardown', stopError)
+        }
       }
       
       await api.endClass({
         room_code: roomCode,
         teacher_identity: teacherIdentity,
+        teacher_access_key: teacherAccessKey,
       })
       onEndClass()
       window.location.href = '/'
