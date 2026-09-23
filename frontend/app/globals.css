@@ -53,6 +53,59 @@ body {
   opacity: 0.65;
 }
 
+/* Give the classroom's primary LiveKit controls recognizable, distinct colors. */
+.classroom-media-controls .lk-button[data-lk-source="microphone"][aria-pressed="true"] {
+  color: #fff !important;
+  background-color: #15803d !important;
+}
+
+.classroom-media-controls .lk-button[data-lk-source="microphone"][aria-pressed="false"] {
+  color: #fff !important;
+  background-color: #a16207 !important;
+}
+
+.classroom-media-controls .lk-button[data-lk-source="microphone"]:not(:disabled):hover {
+  filter: brightness(1.12);
+}
+
+.classroom-media-controls .lk-button[data-lk-source="camera"][aria-pressed="true"] {
+  color: #fff !important;
+  background-color: #2563eb !important;
+}
+
+.classroom-media-controls .lk-button[data-lk-source="camera"][aria-pressed="false"] {
+  color: #fff !important;
+  background-color: #475569 !important;
+}
+
+.classroom-media-controls .lk-button[data-lk-source="camera"]:not(:disabled):hover {
+  filter: brightness(1.12);
+}
+
+.classroom-media-controls .lk-button[data-lk-source="screen_share"] {
+  color: #fff !important;
+  background-color: #6d28d9 !important;
+}
+
+.classroom-media-controls .lk-button[data-lk-source="screen_share"][data-lk-enabled="true"] {
+  background-color: #7e22ce !important;
+}
+
+.classroom-media-controls .lk-button[data-lk-source="screen_share"]:not(:disabled):hover {
+  filter: brightness(1.12);
+}
+
+.classroom-media-controls .lk-disconnect-button {
+  color: #fff !important;
+  background-color: #dc2626 !important;
+  border: 1px solid #ef4444 !important;
+}
+
+.classroom-media-controls .lk-disconnect-button:not(:disabled):hover {
+  background-color: #b91c1c !important;
+  filter: none;
+}
+
 @layer utilities {
   .text-balance {
     text-wrap: balance;

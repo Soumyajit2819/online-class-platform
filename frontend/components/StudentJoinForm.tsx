@@ -33,8 +33,8 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
   const [request, setRequest] = useState<JoinRequest | null>(null)
   const [sessionId, setSessionId] = useState('')
   const [className, setClassName] = useState('')
-  const [inviteInfoLoaded, setInviteInfoLoaded] = useState(!inviteCode)
-  const [passcodeRequired, setPasscodeRequired] = useState(true)
+  const [roomInfoLoaded, setRoomInfoLoaded] = useState(false)
+  const [passcodeRequired, setPasscodeRequired] = useState(false)
   const [googleLoaded, setGoogleLoaded] = useState(false)
   const [googleCredential, setGoogleCredential] = useState('')
   const [loading, setLoading] = useState(false)
@@ -50,11 +50,36 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
       api.getInviteInfo(inviteCode).then(info => {
         setRoomCode(info.room_code)
         setClassName(info.class_name)
-        setPasscodeRequired(info.meeting_passcode_required)
-        setInviteInfoLoaded(true)
+        setPasscodeRequired(info.meeting_passcode_required === true)
+        setRoomInfoLoaded(true)
       }).catch((err: Error) => setError(err.message || 'This class link is invalid or no longer available.'))
     }
   }, [inviteCode])
+
+  const validateRoomCode = async () => {
+    const code = roomCode.trim().toUpperCase()
+    if (!code) {
+      setError('Enter a room code.')
+      return
+    }
+    setLoading(true)
+    setError('')
+    setRoomInfoLoaded(false)
+    try {
+      const info = await api.getClassInfo(code)
+      if (info.is_ended) throw new Error('This class has ended.')
+      if (info.is_locked) throw new Error('Class is locked. New students cannot join.')
+      if (typeof info.meeting_passcode_required !== 'boolean') throw new Error('Unable to verify this class’s password settings. Please try again.')
+      setRoomCode(code)
+      setClassName(info.class_name)
+      setPasscodeRequired(info.meeting_passcode_required)
+      setRoomInfoLoaded(true)
+    } catch (err: any) {
+      setError(err.message || 'Class not found or no longer available.')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const createRequest = useCallback(async (credential: string, passcode: string) => {
     if (!sessionId) return
@@ -80,7 +105,7 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
 
   useEffect(() => {
     const element = googleButtonRef.current
-    if (!googleLoaded || !googleClientId || !window.google || !element || !inviteInfoLoaded || !sessionId) return
+    if (!googleLoaded || !googleClientId || !window.google || !element || !roomInfoLoaded || !sessionId) return
     element.replaceChildren()
     window.google.accounts.id.initialize({
       client_id: googleClientId,
@@ -97,7 +122,7 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
       theme: 'outline', size: 'large', shape: 'rectangular', text: 'continue_with',
       width: Math.max(220, Math.min(400, Math.floor(element.clientWidth || 320))),
     })
-  }, [googleLoaded, googleClientId, handleGoogleCredential, inviteInfoLoaded, sessionId])
+  }, [googleLoaded, googleClientId, handleGoogleCredential, roomInfoLoaded, sessionId])
 
   useEffect(() => {
     if (!sessionId) return
@@ -164,16 +189,19 @@ export default function StudentJoinForm({ inviteCode }: { inviteCode?: string })
         {className && <p className="text-center text-gray-600 mb-5 break-words">{className}</p>}
         {!googleCredential ? (
           <div className="space-y-4">
-            {!inviteCode && <Field label="Room Code" value={roomCode} onChange={value => setRoomCode(value.toUpperCase())} placeholder="e.g., ABC123" />}
-            {googleClientId && inviteInfoLoaded && sessionId ? <>
+            {!inviteCode && <>
+              <Field label="Room Code" value={roomCode} onChange={value => { setRoomCode(value.toUpperCase()); setRoomInfoLoaded(false); setClassName(''); setPasscodeRequired(false) }} placeholder="e.g., ABC123" />
+              {!roomInfoLoaded && <button type="button" onClick={() => void validateRoomCode()} disabled={loading} className="w-full py-3 bg-green-600 hover:bg-green-700 disabled:bg-green-400 text-white font-semibold rounded-lg shadow transition-colors">{loading ? 'Checking class…' : 'Continue'}</button>}
+            </>}
+            {googleClientId && roomInfoLoaded && sessionId ? <>
               <p className="text-center text-sm text-gray-600">Sign in to identify yourself to the teacher.</p>
               <div ref={googleButtonRef} className="flex min-h-10 w-full justify-center" />
               <p className="text-center text-xs text-gray-500">If you close the Google sign-in window, you can try again.</p>
               <Script src="https://accounts.google.com/gsi/client" strategy="afterInteractive" onLoad={() => setGoogleLoaded(true)} onError={() => setError('Google sign-in could not load. Check your connection and try again.')} />
               {googleLoaded && !window.google && <p className="text-sm text-red-700">Google sign-in is unavailable in this browser.</p>}
-            </> : !googleClientId ? <p className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Google sign-in is not configured for this site.</p> : <p className="text-center text-sm text-gray-600">Loading class details…</p>}
+            </> : roomInfoLoaded && !googleClientId ? <p className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">Google sign-in is not configured for this site.</p> : inviteCode && !roomInfoLoaded ? <p className="text-center text-sm text-gray-600">Loading class details…</p> : null}
             {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm break-words">{error}</div>}
-            {loading && <p className="text-center text-sm text-gray-600">Sending your request…</p>}
+            {loading && roomInfoLoaded && <p className="text-center text-sm text-gray-600">Sending your request…</p>}
           </div>
         ) : passcodeRequired ? (
           <form onSubmit={submitPasscode} className="space-y-4">

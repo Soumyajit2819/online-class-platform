@@ -329,6 +329,61 @@ class TestJoinRoom:
 
 
 class TestWaitingRoom:
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_manual_passwordless_join_uses_class_info_and_creates_waiting_request(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Open Class",
+            })
+            room_code = created.json()["room_code"]
+            class_info = await c.get(f"/api/class/{room_code}")
+            session_id = "manual-passwordless-session-01"
+            pending = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "session_id": session_id,
+            })
+            token_before_approval = await c.post(
+                f"/api/student/join-requests/{pending.json()['request_id']}/token",
+                json={"session_id": session_id},
+            )
+        assert class_info.status_code == 200
+        assert class_info.json()["meeting_passcode_required"] is False
+        assert "meeting_passcode" not in class_info.json()
+        assert pending.status_code == 200
+        assert pending.json()["status"] == "WAITING"
+        assert token_before_approval.status_code == 403
+
+    @pytest.mark.asyncio
+    @patch("app.main.livekit_service.create_room", new_callable=AsyncMock)
+    async def test_manual_protected_join_reports_password_required_and_rejects_empty_password(self, mock_create):
+        mock_create.return_value = True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            created = await c.post("/api/teacher/create-room", json={
+                "teacher_name": "John", "room_name": "Protected Class", "meeting_passcode": "join123",
+            })
+            room_code = created.json()["room_code"]
+            class_info = await c.get(f"/api/class/{room_code}")
+            rejected = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": room_code,
+                "session_id": "manual-protected-session-01",
+            })
+        assert class_info.status_code == 200
+        assert class_info.json()["meeting_passcode_required"] is True
+        assert rejected.status_code == 403
+        assert rejected.json()["detail"] == "Incorrect meeting passcode"
+
+    @pytest.mark.asyncio
+    async def test_manual_join_invalid_room_code_returns_not_found(self):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            response = await c.post("/api/student/join-requests", json={
+                "google_credential": "mock-google-id-token", "room_code": "NOPE00",
+                "session_id": "manual-invalid-room-session",
+            })
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Class not found or has ended"
+
     def test_valid_google_identity_uses_configured_audience(self, monkeypatch):
         previous = settings.GOOGLE_CLIENT_ID
         settings.GOOGLE_CLIENT_ID = "student-web-client.apps.googleusercontent.com"

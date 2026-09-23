@@ -96,6 +96,7 @@ function ClassroomContent({
   const [isRecording, setIsRecording] = useState(false)
   const [activeRecordingId, setActiveRecordingId] = useState<string | null>(null)
   const [deviceError, setDeviceError] = useState('')
+  const [teacherPanelOpen, setTeacherPanelOpen] = useState(true)
 
   const teacherIdentity = localParticipant.localParticipant?.identity || ''
   const microphoneRestrictionActive = !!myMicrophoneRestriction?.restricted && (
@@ -205,7 +206,7 @@ function ClassroomContent({
   return (
     // Mobile/tablet: vertical stack (header → video → controls → sidebar), page scrolls.
     // Desktop (lg+): grid with header on top, video + sidebar in the middle, controls at the bottom.
-    <div className="min-h-screen lg:h-screen flex flex-col lg:grid lg:grid-cols-[minmax(0,1fr)_20rem] lg:grid-rows-[auto_minmax(0,1fr)_auto] bg-gray-900 overflow-x-hidden lg:overflow-visible">
+    <div className={`min-h-screen lg:h-screen flex flex-col lg:grid ${isTeacher && !teacherPanelOpen ? 'lg:grid-cols-[minmax(0,1fr)_3.5rem]' : 'lg:grid-cols-[minmax(0,1fr)_20rem]'} lg:grid-rows-[auto_minmax(0,1fr)_auto] bg-gray-900 overflow-x-hidden lg:overflow-visible`}>
       {(roomError || deviceError) && <div role="alert" className="shrink-0 border-b border-red-700 bg-red-950 px-4 py-2 text-sm text-red-100 lg:col-span-full">{deviceError || roomError}<button type="button" onClick={() => { setDeviceError('') }} className="ml-3 underline">Dismiss</button></div>}
       {/* Header */}
       <div className="shrink-0 bg-gray-800 border-b border-gray-700 px-3 sm:px-4 py-2 sm:py-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-4 lg:col-span-full lg:row-start-1">
@@ -239,7 +240,7 @@ function ClassroomContent({
         {!isTeacher && microphoneRestrictionActive && (
           <MicrophoneRestrictionNotice restriction={myMicrophoneRestriction} />
         )}
-        <div className="[&_.lk-control-bar]:flex-wrap [&_.lk-control-bar]:justify-center">
+        <div className="classroom-media-controls [&_.lk-control-bar]:flex-wrap [&_.lk-control-bar]:justify-center">
           <ControlBar
             variation="verbose"
             onDeviceError={({ source, error }) => {
@@ -271,7 +272,19 @@ function ClassroomContent({
 
       {/* Sidebar - Teacher controls or participant list
           Below the controls on mobile/tablet, beside the video on desktop */}
-      <div className="flex-1 flex flex-col bg-gray-800 border-t border-gray-700 lg:border-t-0 lg:border-l lg:min-h-0 lg:overflow-hidden lg:col-start-2 lg:row-start-2">
+      <div className="flex-none flex flex-col bg-gray-800 border-t border-gray-700 lg:border-t-0 lg:border-l lg:min-h-0 lg:overflow-hidden lg:col-start-2 lg:row-start-2">
+        {isTeacher && <button
+          type="button"
+          aria-expanded={teacherPanelOpen}
+          aria-controls="teacher-options-panel"
+          aria-label={teacherPanelOpen ? 'Collapse teacher options' : 'Expand teacher options'}
+          onClick={() => setTeacherPanelOpen(open => !open)}
+          className="flex w-full min-h-12 items-center justify-between gap-3 border-b border-gray-700 bg-gray-800 px-4 py-3 text-left text-sm font-semibold text-white hover:bg-gray-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400"
+        >
+          <span className={teacherPanelOpen ? '' : 'lg:hidden'}>{teacherPanelOpen ? 'Teacher options' : 'Options'}</span>
+          <span aria-hidden="true" className="text-2xl leading-none text-blue-200">{teacherPanelOpen ? '⌄' : '›'}</span>
+        </button>}
+        <div id="teacher-options-panel" hidden={isTeacher && !teacherPanelOpen} className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <ClassChat roomCode={roomCode} isTeacher={isTeacher} teacherIdentity={teacherIdentity} teacherAccessKey={teacherAccessKey} />
         {isTeacher ? (
           <TeacherControls
@@ -301,6 +314,7 @@ function ClassroomContent({
             studentIdentity={teacherIdentity}
           />
         )}
+        </div>
       </div>
 
       {/* Audio renderer */}
@@ -315,6 +329,7 @@ type SelectableDevice = { deviceId: string; label: string }
 
 function DeviceSelectors({ onError }: { onError: (message: string) => void }) {
   const room = useRoomContext()
+  const [open, setOpen] = useState(false)
   const [cameras, setCameras] = useState<SelectableDevice[]>([])
   const [microphones, setMicrophones] = useState<SelectableDevice[]>([])
   const [outputs, setOutputs] = useState<SelectableDevice[]>([])
@@ -387,17 +402,26 @@ function DeviceSelectors({ onError }: { onError: (message: string) => void }) {
     </label>
   )
 
-  return <div className="border-t border-gray-700 bg-gray-800 px-3 py-2 sm:px-4">
-    <div className="mb-2 flex items-center justify-between gap-2">
-      <span className="text-xs font-medium text-gray-300">Devices</span>
-      <button type="button" onClick={() => void refresh()} className="text-xs text-blue-300 underline hover:text-blue-200">Refresh device list</button>
-    </div>
-    <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
-      {selector('Camera', 'videoinput', cameras)}
-      {selector('Microphone input', 'audioinput', microphones)}
-      {outputSupported ? selector('Speaker / audio output', 'audiooutput', outputs) : <p className="self-end pb-2 text-xs text-gray-400">Speaker selection is not supported by this browser.</p>}
-    </div>
-    {scanError && <p className="mt-1 text-xs text-amber-300">{scanError}</p>}
+  return <div className="relative flex justify-center border-t border-gray-700 bg-gray-800 px-3 py-2 sm:px-4">
+    <button
+      type="button"
+      aria-expanded={open}
+      aria-controls="device-settings-menu"
+      onClick={() => setOpen(value => !value)}
+      className="min-h-10 rounded-lg border border-gray-600 bg-gray-700 px-4 py-2 text-sm font-medium text-white hover:bg-gray-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400"
+    >{open ? 'Close device settings' : '⚙ Device settings'}</button>
+    {open && <div id="device-settings-menu" className="absolute bottom-full z-30 mb-2 w-[min(94vw,42rem)] rounded-xl border border-gray-600 bg-gray-900 p-3 shadow-2xl sm:p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <span className="text-sm font-semibold text-white">Media devices</span>
+        <button type="button" onClick={() => void refresh()} className="min-h-9 rounded-md px-3 text-sm text-blue-200 underline hover:text-white">Refresh list</button>
+      </div>
+      <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-3">
+        {selector('Camera', 'videoinput', cameras)}
+        {selector('Microphone input', 'audioinput', microphones)}
+        {outputSupported ? selector('Speaker / audio output', 'audiooutput', outputs) : <p className="self-end pb-2 text-xs leading-5 text-gray-300">Speaker selection is not supported by this browser.</p>}
+      </div>
+      {scanError && <p className="mt-2 text-xs text-amber-300">{scanError}</p>}
+    </div>}
   </div>
 }
 
@@ -930,17 +954,89 @@ function JoinRequests({ roomCode, teacherIdentity, teacherAccessKey }: { roomCod
   const [requests, setRequests] = useState<JoinRequest[]>([])
   const [error, setError] = useState('')
   const [handling, setHandling] = useState<string | null>(null)
+  const seenRequestIds = useRef(new Set<string>())
+  const pendingSoundIds = useRef(new Set<string>())
+  const hasInitialSnapshot = useRef(false)
+  const audioContext = useRef<AudioContext | null>(null)
+  const refreshInFlight = useRef(false)
+
+  const playNotification = useCallback((count = 1) => {
+    const context = audioContext.current
+    if (!context || context.state !== 'running') return false
+    const startAt = context.currentTime + 0.02
+    for (let index = 0; index < count; index += 1) {
+      const start = startAt + index * 0.28
+      const oscillator = context.createOscillator()
+      const gain = context.createGain()
+      oscillator.type = 'sine'
+      oscillator.frequency.setValueAtTime(740, start)
+      oscillator.frequency.setValueAtTime(980, start + 0.09)
+      gain.gain.setValueAtTime(0.0001, start)
+      gain.gain.exponentialRampToValueAtTime(0.12, start + 0.015)
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.19)
+      oscillator.connect(gain)
+      gain.connect(context.destination)
+      oscillator.start(start)
+      oscillator.stop(start + 0.2)
+    }
+    return true
+  }, [])
+
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (!audioContext.current) {
+        const AudioContextConstructor = window.AudioContext
+        if (!AudioContextConstructor) return
+        audioContext.current = new AudioContextConstructor()
+      }
+      const context = audioContext.current
+      void context.resume().then(() => {
+        if (context.state === 'running' && pendingSoundIds.current.size) {
+          const count = pendingSoundIds.current.size
+          pendingSoundIds.current.clear()
+          playNotification(count)
+        }
+      }).catch(() => { /* Keep the visual waiting indicator; a later gesture may unlock audio. */ })
+    }
+    document.addEventListener('pointerdown', unlockAudio)
+    document.addEventListener('keydown', unlockAudio)
+    return () => {
+      document.removeEventListener('pointerdown', unlockAudio)
+      document.removeEventListener('keydown', unlockAudio)
+      const context = audioContext.current
+      audioContext.current = null
+      if (context && context.state !== 'closed') void context.close()
+    }
+  }, [playNotification])
 
   const refresh = useCallback(async () => {
-    if (!teacherIdentity) return
+    if (!teacherIdentity || refreshInFlight.current) return
+    refreshInFlight.current = true
     try {
       const response = await api.getWaitingJoinRequests(roomCode, teacherIdentity)
-      setRequests(response.requests)
+      const pending = response.requests.filter(request => request.status === 'WAITING')
+      if (hasInitialSnapshot.current) {
+        for (const request of pending) {
+          if (seenRequestIds.current.has(request.request_id)) continue
+          seenRequestIds.current.add(request.request_id)
+          pendingSoundIds.current.add(request.request_id)
+        }
+        if (pendingSoundIds.current.size && playNotification(pendingSoundIds.current.size)) {
+          pendingSoundIds.current.clear()
+        }
+      } else {
+        // Do not sound old requests merely because the teacher refreshed or joined late.
+        pending.forEach(request => seenRequestIds.current.add(request.request_id))
+        hasInitialSnapshot.current = true
+      }
+      const activeIds = new Set(pending.map(request => request.request_id))
+      pendingSoundIds.current.forEach(id => { if (!activeIds.has(id)) pendingSoundIds.current.delete(id) })
+      setRequests(pending)
       setError('')
     } catch {
       setError('Unable to load join requests. Retrying...')
-    }
-  }, [roomCode, teacherIdentity])
+    } finally { refreshInFlight.current = false }
+  }, [roomCode, teacherIdentity, playNotification])
 
   useEffect(() => {
     refresh()
@@ -962,7 +1058,10 @@ function JoinRequests({ roomCode, teacherIdentity, teacherAccessKey }: { roomCod
 
   return (
     <div className="mb-6">
-      <h3 className="text-sm font-medium text-gray-300 mb-2">🚪 Join Requests ({requests.length})</h3>
+      <h3 className="flex items-center justify-between gap-2 text-sm font-medium text-gray-300 mb-2">
+        <span>🚪 Join Requests ({requests.length})</span>
+        {requests.length > 0 && <span role="status" className="rounded-full border border-amber-500/50 bg-amber-900/60 px-2.5 py-1 text-xs font-semibold text-amber-100">🔔 {requests.length} waiting</span>}
+      </h3>
       {error && <p className="mb-2 text-xs text-amber-300">{error}</p>}
       {requests.length === 0 ? <p className="text-sm text-gray-400">No students are waiting.</p> : (
         <div className="space-y-2">
