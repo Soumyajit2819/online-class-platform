@@ -29,6 +29,15 @@ class Settings:
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     SUPABASE_ANON_KEY:         str = os.getenv("SUPABASE_ANON_KEY", "")
 
+    # Optional, disabled until a concrete server-side provider adapter is chosen.
+    CLASS_INTELLIGENCE_STT_PROVIDER: str = os.getenv("CLASS_INTELLIGENCE_STT_PROVIDER", "")
+    CLASS_INTELLIGENCE_STT_MODEL: str = os.getenv("CLASS_INTELLIGENCE_STT_MODEL", "")
+    SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
+    CLASS_INTELLIGENCE_NOTES_PROVIDER: str = os.getenv("CLASS_INTELLIGENCE_NOTES_PROVIDER", "")
+    CLASS_INTELLIGENCE_NOTES_MODEL: str = os.getenv("CLASS_INTELLIGENCE_NOTES_MODEL", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_API_BASE_URL: str = os.getenv("GEMINI_API_BASE_URL", "")
+
     # HMAC key used only for short-lived recording playback URLs.  This must be
     # independent of LiveKit and storage credentials so neither is ever sent to
     # a browser.

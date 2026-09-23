@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Literal
 from enum import Enum
 
@@ -114,6 +114,13 @@ class LockClassRequest(BaseModel):
 class EndClassRequest(BaseModel):
     room_code: str
     teacher_identity: str
+    teacher_access_key: str
+
+
+class TranscriptAccessRequest(BaseModel):
+    google_credential: Optional[str] = Field(default=None, max_length=8192)
+    teacher_identity: Optional[str] = Field(default=None, max_length=128)
+    teacher_access_key: Optional[str] = Field(default=None, min_length=1, max_length=256)
 
 
 class StartRecordingRequest(BaseModel):

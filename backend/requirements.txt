@@ -9,6 +9,9 @@ pydantic-settings==2.1.0
 # LiveKit
 livekit-api==1.2.1
 
+# Sarvam Batch Speech-to-Text
+sarvamai==0.1.34
+
 # Supabase
 supabase==2.31.0
 

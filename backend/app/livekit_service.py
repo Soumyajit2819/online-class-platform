@@ -4,16 +4,21 @@ import asyncio
 import hmac
 import base64
 import json
+import posixpath
+from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta, timezone
 import aiohttp
-from livekit.api import AccessToken, VideoGrants
+from livekit.api import AccessToken, VideoGrants, WebhookReceiver, TokenVerifier
 from livekit.api.room_service import RoomService, CreateRoomRequest
 from livekit.api.egress_service import EgressService, RoomCompositeEgressRequest
 from livekit.api import (
     SegmentedFileOutput, SegmentedFileProtocol, S3Upload, EncodingOptions,
     AudioCodec, VideoCodec,
 )
+from livekit.protocol.egress import EgressStatus, ListEgressRequest, StopEgressRequest
+from livekit.protocol.webhook import WebhookEvent
+from google.protobuf.json_format import MessageToDict, ParseDict
 from .config import settings
 from .models import MicrophonePolicy, CameraPolicy
 
@@ -623,6 +628,7 @@ class LiveKitService:
             "storage_prefix": prefix, "playlist_key": f"{prefix}index.m3u8",
             "egress_id": None, "started_at": now.isoformat(), "ended_at": None,
             "expires_at": (now + timedelta(hours=20)).isoformat(), "status": "starting",
+            "livekit_room_name": livekit_room_name,
         }
         try:
             await self._create_recording_metadata(record)
@@ -644,17 +650,41 @@ class LiveKitService:
                                          key_frame_interval=8),
             )
             egress = await (await self.get_egress_service()).start_room_composite_egress(request)
-            await self._update_recording_metadata(recording_id, {"egress_id": egress.egress_id, "status": "recording"})
+            egress_status = int(getattr(egress, "status", EgressStatus.EGRESS_STARTING))
+            if egress_status in (EgressStatus.EGRESS_FAILED, EgressStatus.EGRESS_ABORTED,
+                                 EgressStatus.EGRESS_LIMIT_REACHED):
+                await self._update_recording_metadata(recording_id, {
+                    "egress_id": egress.egress_id, "status": "failed",
+                    "finalization_last_error": getattr(egress, "error", "Egress failed during start"),
+                })
+                return {"success": False, "recording_id": recording_id,
+                        "error": getattr(egress, "error", "LiveKit Egress failed to start")}
+            app_status = "recording" if egress_status == EgressStatus.EGRESS_ACTIVE else "starting"
+            await self._update_recording_metadata(recording_id, {
+                "egress_id": egress.egress_id, "status": app_status,
+                "finalization_last_error": None,
+            })
             recording_state.add_recording(room_code, recording_id, egress.egress_id,
                                           livekit_room_name, class_name, teacher_name)
             session_state.set_recording(room_code, True, recording_id)
-            return {"success": True, "recording_id": recording_id, "egress_id": egress.egress_id, "status": "recording"}
-        except Exception as e:
-            # No orphan row for an egress that never started.
             try:
-                await self._recording_query(lambda: self._recordings_table().delete().eq("recording_id", recording_id).execute())
+                await self._associate_recording(record)
+            except Exception as association_error:
+                # Recording must remain usable if class-history persistence is
+                # temporarily unavailable. Reconciliation retries association.
+                print(f"Could not associate recording with meeting yet: {association_error}")
+            return {"success": True, "recording_id": recording_id, "egress_id": egress.egress_id, "status": app_status}
+        except Exception as e:
+            # A start RPC can time out after LiveKit accepted the request.
+            # Retain the durable starting row so reconciliation can discover an
+            # Egress by room name instead of deleting evidence of a live job.
+            try:
+                await self._update_recording_metadata(recording_id, {
+                    "finalization_last_error": f"Egress start outcome unknown: {e}",
+                    "finalization_next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+                })
             except Exception as cleanup_error:
-                print(f"Could not remove failed recording metadata: {cleanup_error}")
+                print(f"Could not persist uncertain Egress start state: {cleanup_error}")
             print(f"Error starting HLS recording: {e}")
             return {"success": False, "error": str(e)}
 
@@ -663,42 +693,58 @@ class LiveKitService:
             record = await self.get_recording_metadata(recording_id)
             if not record or record["room_code"] != room_code or not record.get("egress_id"):
                 return {"success": False, "error": "Recording not found"}
-            from livekit.api.egress_service import StopEgressRequest
-            await (await self.get_egress_service()).stop_egress(StopEgressRequest(egress_id=record["egress_id"]))
-            ended = datetime.now(timezone.utc)
-            ended_at = ended.isoformat()
+            now = datetime.now(timezone.utc)
             await self._update_recording_metadata(recording_id, {
-                "status": "processing", "ended_at": ended_at,
+                "status": "processing", "stop_requested_at": now.isoformat(),
+                "finalization_next_attempt_at": now.isoformat(),
+                "finalization_lease_until": None,
+            })
+            egress_info = await (await self.get_egress_service()).stop_egress(
+                StopEgressRequest(egress_id=record["egress_id"]))
+            ended = datetime.now(timezone.utc)
+            await self._update_recording_metadata(recording_id, {
+                "status": "processing", "ended_at": ended.isoformat(),
                 "expires_at": (ended + timedelta(hours=20)).isoformat(),
+                "finalization_lease_until": None,
             })
             recording_state.update_status(recording_id, "processing", datetime.utcnow())
             session_state.set_recording(room_code, False, None)
+            status = int(egress_info.status)
+            if status in (EgressStatus.EGRESS_FAILED, EgressStatus.EGRESS_ABORTED,
+                          EgressStatus.EGRESS_LIMIT_REACHED):
+                await self._mark_egress_failed(recording_id, egress_info)
+                return {"success": False, "recording_id": recording_id, "status": "failed",
+                        "error": getattr(egress_info, "error", "LiveKit Egress failed")}
+            if status == EgressStatus.EGRESS_COMPLETE:
+                await self._finalize_egress(record, egress_info)
+                current = await self.get_recording_metadata(recording_id)
+                return {"success": True, "recording_id": recording_id,
+                        "status": current["status"] if current else "processing",
+                        "message": "Recording stop acknowledged; final output is being verified."}
             return {"success": True, "recording_id": recording_id, "status": "processing",
-                    "message": "Recording stopped; HLS playlist is being finalized."}
+                    "message": "Recording stop requested; final output is being verified asynchronously."}
         except Exception as e:
+            # Keep a durable processing row and let the worker retry the stop
+            # or reconcile Egress state. The class-ending route can continue.
+            try:
+                await self._update_recording_metadata(recording_id, {
+                    "status": "processing",
+                    "finalization_last_error": f"Stop request failed: {e}",
+                    "finalization_next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+                    "finalization_lease_until": None,
+                })
+            except Exception:
+                pass
             print(f"Error stopping recording: {e}")
             return {"success": False, "error": str(e)}
 
     async def list_recordings(self) -> List[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         response = await self._recording_query(
-            lambda: self._recordings_table().select("*").gt("expires_at", now.isoformat()).neq("status", "failed").order("started_at", desc=True).execute())
+            lambda: self._recordings_table().select("*").gt("expires_at", now.isoformat()).order("started_at", desc=True).execute())
         recordings = []
         for rec in response.data:
             expires = datetime.fromisoformat(rec["expires_at"].replace("Z", "+00:00"))
-            if rec["status"] == "processing":
-                # The final playlist is the durable completion signal when no webhook is configured.
-                exists = await self.object_exists(rec["playlist_key"])
-                if exists:
-                    await self._update_recording_metadata(rec["recording_id"], {"status": "available"})
-                    rec["status"] = "available"
-                elif rec.get("ended_at"):
-                    ended = datetime.fromisoformat(rec["ended_at"].replace("Z", "+00:00"))
-                    # A stopped egress that has not produced a playlist after
-                    # finalization time is failed, not a perpetually stale row.
-                    if now - ended > timedelta(minutes=10):
-                        await self.delete_recording(rec)
-                        continue
             rec["hours_left"] = max(0, int((expires - now).total_seconds() // 3600))
             rec["playback_url"] = None
             recordings.append(rec)
@@ -713,8 +759,413 @@ class LiveKitService:
                 return False
         return await self._run_in_thread(_exists)
 
+    async def _associate_recording(self, record: Dict[str, Any]) -> Optional[str]:
+        from . import class_intelligence
+        return await class_intelligence.associate_recording_with_meeting(
+            room_code=record["room_code"], recording_id=record["recording_id"],
+            recording_started_at=record["started_at"],
+        )
+
+    async def _mark_egress_failed(self, recording_id: str, info) -> None:
+        detail = getattr(info, "error", "") or getattr(info, "details", "") or "LiveKit Egress failed"
+        ended_at = self._egress_datetime(getattr(info, "ended_at", 0)) or datetime.now(timezone.utc)
+        await self._update_recording_metadata(recording_id, {
+            "status": "failed", "finalization_last_error": str(detail)[:2000],
+            "ended_at": ended_at.isoformat(),
+            "expires_at": (ended_at + timedelta(hours=20)).isoformat(),
+            "finalization_lease_until": None,
+        })
+        recording_state.update_status(recording_id, "failed", datetime.utcnow())
+
+    @staticmethod
+    def _egress_datetime(timestamp: int | float | None) -> Optional[datetime]:
+        if not timestamp:
+            return None
+        value = float(timestamp)
+        if value > 10_000_000_000:
+            value /= 1000
+        try:
+            return datetime.fromtimestamp(value, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    async def _validate_final_hls(self, record: Dict[str, Any], info) -> bool:
+        """Validate terminal Egress metadata and every listed HLS segment cheaply."""
+        results = list(getattr(info, "segment_results", []) or [])
+        if not results:
+            legacy_result = getattr(info, "segments", None)
+            has_field = getattr(info, "HasField", None)
+            if legacy_result is not None:
+                try:
+                    legacy_present = has_field("segments") if callable(has_field) else True
+                except (TypeError, ValueError):
+                    legacy_present = False
+                if legacy_present:
+                    results = [legacy_result]
+        if not results:
+            raise RuntimeError("Successful Egress response has no HLS segment results")
+        result = results[0]
+        segment_count = int(getattr(result, "segment_count", 0))
+        if segment_count <= 0:
+            raise RuntimeError("Successful Egress response reports no HLS segments")
+        playlist_name = getattr(result, "playlist_name", "")
+        if playlist_name and posixpath.basename(playlist_name) != posixpath.basename(record["playlist_key"]):
+            raise RuntimeError("LiveKit finalized a different playlist than the configured recording playlist")
+
+        prefix = record["storage_prefix"]
+        playlist_key = record["playlist_key"]
+
+        def _inspect_storage():
+            s3 = self._s3_client()
+            playlist_obj = s3.get_object(Bucket=self.s3_bucket, Key=playlist_key)
+            playlist = playlist_obj["Body"].read().decode("utf-8")
+            if "#EXT-X-ENDLIST" not in playlist:
+                raise RuntimeError("Final HLS playlist does not contain EXT-X-ENDLIST")
+            segment_uris = [
+                line.strip() for line in playlist.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if len(segment_uris) != segment_count:
+                raise RuntimeError("HLS playlist segment count does not match LiveKit Egress results")
+            expected_keys = set()
+            for uri in segment_uris:
+                uri_path = uri.split("?", 1)[0]
+                if "://" in uri_path or uri_path.startswith("/"):
+                    raise RuntimeError("Unexpected non-relative segment URI in finalized HLS playlist")
+                key = posixpath.normpath(posixpath.join(prefix, uri_path))
+                if key == ".." or key.startswith("../") or not key.startswith(prefix):
+                    raise RuntimeError("Unsafe segment path in finalized HLS playlist")
+                expected_keys.add(key)
+            actual_keys = set()
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.s3_bucket, Prefix=prefix):
+                for item in page.get("Contents", []):
+                    key = item["Key"]
+                    if key.endswith((".ts", ".m4s", ".mp4")):
+                        actual_keys.add(key)
+            return expected_keys.issubset(actual_keys)
+
+        return await self._run_in_thread(_inspect_storage)
+
+    async def _finalize_egress(self, record: Dict[str, Any], info) -> bool:
+        status = int(info.status)
+        if status in (EgressStatus.EGRESS_FAILED, EgressStatus.EGRESS_ABORTED,
+                      EgressStatus.EGRESS_LIMIT_REACHED):
+            await self._mark_egress_failed(record["recording_id"], info)
+            return True
+        if status != EgressStatus.EGRESS_COMPLETE:
+            await self._update_recording_metadata(record["recording_id"], {
+                "status": "processing", "finalization_next_attempt_at":
+                    (datetime.now(timezone.utc) + timedelta(seconds=45)).isoformat(),
+                "finalization_lease_until": None,
+            })
+            return False
+
+        try:
+            valid = await self._validate_final_hls(record, info)
+        except Exception as exc:
+            # Missing objects and transient storage errors stay retryable. Do
+            # not delete or permanently fail a recording on a storage check.
+            await self._update_recording_metadata(record["recording_id"], {
+                "status": "processing", "finalization_last_error": str(exc)[:2000],
+                "finalization_next_attempt_at":
+                    (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                "finalization_lease_until": None,
+            })
+            return False
+        if not valid:
+            await self._update_recording_metadata(record["recording_id"], {
+                "status": "processing", "finalization_last_error": "One or more finalized HLS segments are not accessible yet",
+                "finalization_next_attempt_at":
+                    (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                "finalization_lease_until": None,
+            })
+            return False
+
+        await self._update_recording_metadata(record["recording_id"], {
+            "status": "available", "finalized_at": datetime.now(timezone.utc).isoformat(),
+            "ended_at": (self._egress_datetime(getattr(info, "ended_at", 0)) or
+                         datetime.now(timezone.utc)).isoformat(),
+            "finalization_last_error": None, "finalization_lease_until": None,
+        })
+        recording_state.update_status(record["recording_id"], "available", datetime.utcnow())
+        await self._queue_ready_recording(record["recording_id"])
+        return True
+
+    async def _queue_ready_recording(self, recording_id: str) -> None:
+        from supabase import create_client
+        await self._recording_query(lambda: create_client(
+            settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
+        ).rpc("enqueue_ready_recording", {"p_recording_id": recording_id}).execute())
+
+    async def receive_egress_webhook(self, event: WebhookEvent) -> Dict[str, Any]:
+        event_name = event.event
+        if event_name not in ("egress_started", "egress_updated", "egress_ended"):
+            return {"success": True, "ignored": True}
+        if not event.HasField("egress_info") or not event.egress_info.egress_id:
+            return {"success": True, "ignored": True}
+
+        from supabase import create_client
+        payload = MessageToDict(event, preserving_proto_field_name=True)
+        event_id = event.id or f"{event.egress_info.egress_id}:{event_name}:{event.egress_info.status}"
+
+        def _save_event():
+            table = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY).table("livekit_egress_events")
+            table.upsert({
+                "event_id": event_id, "event_name": event_name,
+                "egress_id": event.egress_info.egress_id, "payload": payload,
+                "status": "received",
+            }, on_conflict="event_id", ignore_duplicates=True).execute()
+            result = table.select("*").eq("event_id", event_id).limit(1).execute()
+            return result.data[0] if result.data else None
+
+        row = await self._recording_query(_save_event)
+        if not row or row.get("status") in ("processed", "ignored"):
+            return {"success": True, "duplicate": True}
+        await self._process_egress_event_row(row)
+        return {"success": True, "received": True}
+
+    async def _process_egress_event_row(self, row: Dict[str, Any]) -> None:
+        from supabase import create_client
+        event = ParseDict(row["payload"], WebhookEvent(), ignore_unknown_fields=True)
+        info = event.egress_info
+        record = await self.get_recording_by_egress_id(info.egress_id)
+        if record is None:
+            # Webhook can arrive before the start response's ID update commits.
+            # The Egress may finish before list_egress can recover it, so use
+            # the webhook's room and start time to repair that missing link.
+            record = await self._match_starting_recording(info)
+            if record is None:
+                await self._defer_egress_event(row, "No recording row matches this Egress ID yet")
+                return
+        if event.event == "egress_started":
+            if record["status"] == "starting":
+                await self._update_recording_metadata(record["recording_id"], {
+                    "egress_id": info.egress_id, "status": "recording",
+                    "finalization_last_error": None,
+                })
+            try:
+                await self._associate_recording(record)
+            except Exception as exc:
+                print(f"Could not associate Egress-started recording yet: {exc}")
+        elif event.event == "egress_updated":
+            if int(info.status) in (EgressStatus.EGRESS_COMPLETE, EgressStatus.EGRESS_FAILED,
+                                    EgressStatus.EGRESS_ABORTED, EgressStatus.EGRESS_LIMIT_REACHED):
+                await self._finalize_egress(record, info)
+        elif event.event == "egress_ended":
+            await self._finalize_egress(record, info)
+
+        await self._recording_query(lambda: create_client(
+            settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
+        ).table("livekit_egress_events").update({
+            "status": "processed", "processed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("event_id", row["event_id"]).execute())
+
+    async def _match_starting_recording(self, info: Any) -> Optional[Dict[str, Any]]:
+        room_name = getattr(info, "room_name", "")
+        egress_started_at = float(getattr(info, "started_at", 0) or 0)
+        if not room_name or not egress_started_at:
+            return None
+        if egress_started_at > 10_000_000_000:
+            egress_started_at /= 1000
+
+        response = await self._recording_query(lambda: self._recordings_table()
+            .select("*").eq("livekit_room_name", room_name).eq("status", "starting")
+            .is_("egress_id", "null").execute())
+        matches = []
+        for candidate in response.data or []:
+            try:
+                started_at = datetime.fromisoformat(
+                    candidate["started_at"].replace("Z", "+00:00")
+                ).timestamp()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(started_at - egress_started_at) <= 300:
+                matches.append(candidate)
+        if len(matches) != 1:
+            return None
+
+        record = matches[0]
+        await self._update_recording_metadata(record["recording_id"], {
+            "egress_id": info.egress_id,
+            "status": "processing",
+            "finalization_last_error": None,
+        })
+        record.update({"egress_id": info.egress_id, "status": "processing"})
+        return record
+
+    async def _defer_egress_event(self, row: Dict[str, Any], error: str) -> None:
+        from supabase import create_client
+        attempts = int(row.get("attempts", 0))
+        delay = min(60 * (2 ** min(attempts, 6)), 3600)
+        await self._recording_query(lambda: create_client(
+            settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
+        ).table("livekit_egress_events").update({
+            "last_error": error[:2000],
+            "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(),
+            "lease_until": None,
+        }).eq("event_id", row["event_id"]).execute())
+
+    async def get_recording_by_egress_id(self, egress_id: str) -> Optional[Dict[str, Any]]:
+        response = await self._recording_query(
+            lambda: self._recordings_table().select("*").eq("egress_id", egress_id).limit(1).execute())
+        return response.data[0] if response.data else None
+
+    async def _recover_starting_egress(self, record: Dict[str, Any]) -> Optional[Any]:
+        room_name = record.get("livekit_room_name")
+        if not room_name:
+            return None
+        service = await self.get_egress_service()
+        response = await service.list_egress(ListEgressRequest(room_name=room_name))
+        start_time = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00")).timestamp()
+        matches = []
+        for item in response.items:
+            item_start = float(item.started_at)
+            # LiveKit protocol timestamps are milliseconds; tolerate seconds
+            # for SDK/server combinations that serialize them differently.
+            if item_start > 10_000_000_000:
+                item_start /= 1000
+            if abs(item_start - start_time) <= 300:
+                matches.append(item)
+        if len(matches) != 1:
+            return None
+        info = matches[0]
+        await self._update_recording_metadata(record["recording_id"], {
+            "egress_id": info.egress_id, "status": "processing",
+            "finalization_last_error": None,
+        })
+        return info
+
+    async def reconcile_pending_recordings(self) -> int:
+        from supabase import create_client
+
+        def _claim():
+            return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY).rpc(
+                "claim_recording_finalization_batch", {"p_batch_size": 20}
+            ).execute().data
+
+        records = await self._recording_query(_claim) or []
+        completed = 0
+        for record in records:
+            try:
+                info = None
+                if record.get("egress_id"):
+                    response = await (await self.get_egress_service()).list_egress(
+                        ListEgressRequest(egress_id=record["egress_id"]))
+                    info = next((item for item in response.items if item.egress_id == record["egress_id"]), None)
+                elif record["status"] == "starting":
+                    info = await self._recover_starting_egress(record)
+
+                if info is None:
+                    # Completed Egress may no longer be listed. Absence is not
+                    # evidence of failure; retain and back off for another poll.
+                    await self._update_recording_metadata(record["recording_id"], {
+                        "finalization_last_error": "Egress not currently visible; awaiting webhook or next reconciliation",
+                        "finalization_next_attempt_at":
+                            (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                        "finalization_lease_until": None,
+                    })
+                    continue
+
+                status = int(info.status)
+                if status == EgressStatus.EGRESS_STARTING or (
+                    status == EgressStatus.EGRESS_ACTIVE and not record.get("stop_requested_at")
+                ):
+                    await self._update_recording_metadata(record["recording_id"], {
+                        "status": "starting" if status == EgressStatus.EGRESS_STARTING else "recording",
+                        "finalization_lease_until": None,
+                        "finalization_next_attempt_at":
+                            (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                    })
+                    continue
+                if status in (EgressStatus.EGRESS_STARTING, EgressStatus.EGRESS_ACTIVE) and record.get("stop_requested_at"):
+                    try:
+                        info = await (await self.get_egress_service()).stop_egress(
+                            StopEgressRequest(egress_id=info.egress_id))
+                    except Exception as exc:
+                        await self._update_recording_metadata(record["recording_id"], {
+                            "finalization_last_error": f"Retry stop request failed: {exc}"[:2000],
+                            "finalization_next_attempt_at":
+                                (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                            "finalization_lease_until": None,
+                        })
+                        continue
+                done = await self._finalize_egress(record, info)
+                completed += int(done)
+                if record.get("status") == "available":
+                    try:
+                        await self._associate_recording(record)
+                        await self._queue_ready_recording(record["recording_id"])
+                    except Exception:
+                        pass
+            except Exception as exc:
+                # Release the lease and back off; do not turn transient DB,
+                # Egress API, or storage errors into permanent recording loss.
+                try:
+                    await self._update_recording_metadata(record["recording_id"], {
+                        "finalization_last_error": str(exc)[:2000],
+                        "finalization_next_attempt_at":
+                            (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+                        "finalization_lease_until": None,
+                    })
+                except Exception:
+                    pass
+        await self._reconcile_received_webhooks()
+        await self._queue_available_recordings_without_jobs()
+        return completed
+
+    async def _reconcile_received_webhooks(self) -> None:
+        from supabase import create_client
+        def _claim():
+            return create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY).rpc(
+                "claim_livekit_egress_events_batch", {"p_batch_size": 50}
+            ).execute().data
+        for row in await self._recording_query(_claim) or []:
+            try:
+                await self._process_egress_event_row(row)
+            except Exception as exc:
+                print(f"Could not process persisted Egress webhook: {exc}")
+                try:
+                    await self._defer_egress_event(row, str(exc))
+                except Exception:
+                    pass
+
+    async def _queue_available_recordings_without_jobs(self) -> None:
+        from supabase import create_client
+        def _recover_and_enqueue():
+            client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+            client.rpc("associate_unlinked_available_recordings", {"p_limit": 50}).execute()
+            return client.rpc("enqueue_available_recordings_batch", {"p_limit": 50}).execute()
+        await self._recording_query(_recover_and_enqueue)
+
+    async def _prune_processed_webhook_events(self) -> None:
+        from supabase import create_client
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        await self._recording_query(lambda: create_client(
+            settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY
+        ).table("livekit_egress_events").delete().lt("received_at", cutoff)
+         .neq("status", "received").execute())
+
+    async def reconciliation_worker(self) -> None:
+        prune_at = datetime.now(timezone.utc)
+        while True:
+            if settings.validate_supabase_db():
+                try:
+                    await self.reconcile_pending_recordings()
+                    if datetime.now(timezone.utc) >= prune_at:
+                        await self._prune_processed_webhook_events()
+                        prune_at = datetime.now(timezone.utc) + timedelta(hours=24)
+                except Exception as exc:
+                    print(f"Recording reconciliation error: {exc}")
+            await asyncio.sleep(60)
+
     async def get_object(self, key: str) -> bytes:
         return await self._run_in_thread(lambda: self._s3_client().get_object(Bucket=self.s3_bucket, Key=key)["Body"].read())
+
+    async def download_object_to_path(self, key: str, destination: Path) -> None:
+        """Download one private storage object straight to a local file."""
+        await self._run_in_thread(lambda: self._s3_client().download_file(
+            self.s3_bucket, key, str(destination)))
 
     def create_playback_token(self, recording_id: str, expires_at: str, ttl_seconds: int = 2 * 3600) -> str:
         """Short-lived, scoped bearer token for one recording's playlist and segments."""
@@ -758,7 +1209,9 @@ class LiveKitService:
         """Idempotently delete full expired prefixes, never an active recording."""
         now = datetime.now(timezone.utc).isoformat()
         response = await self._recording_query(
-            lambda: self._recordings_table().select("*").lte("expires_at", now).neq("status", "recording").neq("status", "starting").execute())
+            lambda: self._recordings_table().select("*").lte("expires_at", now)
+            .neq("status", "recording").neq("status", "starting")
+            .neq("status", "processing").execute())
         removed = 0
         for rec in response.data:
             await self.delete_recording(rec)

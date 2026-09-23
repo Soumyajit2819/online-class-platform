@@ -112,6 +112,12 @@ export interface ModerationRequest {
   target_identity?: string;
 }
 
+export interface EndClassRequest {
+  room_code: string;
+  teacher_identity: string;
+  teacher_access_key: string;
+}
+
 export interface SetPolicyRequest {
   room_code: string;
   teacher_identity: string;
@@ -142,6 +148,21 @@ export interface Recording {
   expires_at: string;
   hours_left: number;
   playback_url: string | null;
+}
+
+export interface RecordingMeetingNotes {
+  meeting_id: string;
+  room_code: string;
+  class_name: string;
+  meeting_started_at: string;
+  ended_at: string | null;
+  notes_status: 'pending' | 'processing' | 'ready' | 'failed' | 'unavailable' | string;
+  english_notes: string | null;
+  bengali_notes: string | null;
+  error_code: string | null;
+  updated_at: string | null;
+  completed_at: string | null;
+  recording_ids: string[];
 }
 
 class ApiError extends Error {
@@ -265,7 +286,7 @@ export const api = {
     });
   },
 
-  async endClass(data: ModerationRequest): Promise<{ success: boolean; message: string }> {
+  async endClass(data: EndClassRequest): Promise<{ success: boolean; message: string }> {
     return fetchApi('/api/teacher/end-class', {
       method: 'POST',
       body: JSON.stringify(data),
@@ -300,6 +321,14 @@ export const api = {
 
   async getAllRecordings(): Promise<{ recordings: Recording[]; total: number }> {
     return fetchApi('/api/recordings');
+  },
+
+  async getRecordingsMeetingNotes(): Promise<{ meetings: RecordingMeetingNotes[]; total: number }> {
+    return fetchApi('/api/recordings/meeting-notes');
+  },
+
+  async getMeetingNotesDownload(meetingId: string, language: 'english' | 'bengali'): Promise<{ class_name: string; content: string }> {
+    return fetchApi(`/api/recordings/meeting-notes/${encodeURIComponent(meetingId)}/download/${language}`);
   },
 
   async downloadRecording(recordingId: string): Promise<{ blob: Blob; filename: string }> {

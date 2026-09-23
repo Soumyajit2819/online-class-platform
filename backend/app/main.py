@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, BackgroundTasks, Request
 from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
 from urllib.parse import quote
@@ -24,10 +24,13 @@ from .models import (
     StudentMuteRestrictionRequest, StudentUnmuteRestrictionRequest,
     LockClassRequest, EndClassRequest,
     StartRecordingRequest, StopRecordingRequest,
-    MicrophonePolicy, CameraPolicy,
+    MicrophonePolicy, CameraPolicy, TranscriptAccessRequest,
 )
 from .livekit_service import livekit_service, session_state, recording_state
 from .passcode_service import passcode_service
+from . import class_intelligence
+from . import transcription
+from livekit.api import WebhookReceiver, TokenVerifier
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +71,20 @@ async def lifespan(app: FastAPI):
         await passcode_service.init_db()
 
     task = asyncio.create_task(_cleanup_loop())
+    enrollment_retry_task = asyncio.create_task(class_intelligence.enrollment_retry_worker())
+    recording_reconciliation_task = asyncio.create_task(livekit_service.reconciliation_worker())
+    transcription_task = asyncio.create_task(transcription.transcription_worker())
     print("✓ Application startup complete")
 
     yield  # app runs here
 
     # Shutdown
     task.cancel()
+    enrollment_retry_task.cancel()
+    recording_reconciliation_task.cancel()
+    transcription_task.cancel()
+    await asyncio.gather(task, enrollment_retry_task, recording_reconciliation_task,
+                         transcription_task, return_exceptions=True)
     print("✓ Application shutdown complete")
 
 
@@ -117,12 +128,90 @@ async def health_check():
     }
 
 
+@app.post("/api/livekit/webhook")
+async def livekit_webhook(request: Request, authorization: str | None = Header(default=None)):
+    """Validate LiveKit's signed webhook, then persist Egress events for processing."""
+    if not settings.LIVEKIT_API_KEY or not settings.LIVEKIT_API_SECRET:
+        raise HTTPException(503, "LiveKit webhook verification is not configured")
+    if not authorization:
+        raise HTTPException(401, "Missing LiveKit webhook authorization")
+    body = await request.body()
+    try:
+        receiver = WebhookReceiver(TokenVerifier(settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET))
+        event = receiver.receive(body.decode("utf-8"), authorization)
+    except Exception:
+        raise HTTPException(401, "Invalid LiveKit webhook signature or payload")
+    try:
+        return await livekit_service.receive_egress_webhook(event)
+    except Exception as exc:
+        print(f"LiveKit webhook persistence failed; sender may retry: {exc}")
+        raise HTTPException(503, "Webhook could not be durably recorded")
+
+
+@app.post("/api/class/{room_code}/meetings/{meeting_id}/transcript")
+async def get_meeting_transcript(room_code: str, meeting_id: str,
+                                 request: TranscriptAccessRequest):
+    """Retrieve transcript/status for its teacher or an enrolled student."""
+    student_identity = None
+    teacher_identity = request.teacher_identity
+    teacher_access_key = request.teacher_access_key
+    if request.google_credential:
+        if teacher_identity or teacher_access_key:
+            raise HTTPException(403, "Provide one class identity")
+        student = await asyncio.to_thread(verify_google_credential, request.google_credential)
+        student_identity = f"google_{student['sub']}"
+    elif not (teacher_identity and teacher_access_key):
+        raise HTTPException(401, "Class authorization is required")
+    try:
+        return await class_intelligence.get_authorized_meeting_transcript(
+            room_code=room_code, meeting_id=meeting_id,
+            student_identity=student_identity,
+            teacher_identity=teacher_identity,
+            teacher_access_key=teacher_access_key,
+        )
+    except class_intelligence.TranscriptAccessDenied:
+        raise HTTPException(403, "You are not authorized to access this class transcript")
+    except LookupError:
+        raise HTTPException(404, "Class meeting not found")
+    except Exception:
+        raise HTTPException(503, "Transcript service is temporarily unavailable")
+
+
+@app.post("/api/class/{room_code}/meetings/{meeting_id}/notes")
+async def get_meeting_notes(room_code: str, meeting_id: str,
+                            request: TranscriptAccessRequest):
+    """Retrieve permanent English/Bengali notes for its teacher or an enrolled student."""
+    student_identity = None
+    teacher_identity = request.teacher_identity
+    teacher_access_key = request.teacher_access_key
+    if request.google_credential:
+        if teacher_identity or teacher_access_key:
+            raise HTTPException(403, "Provide one class identity")
+        student = await asyncio.to_thread(verify_google_credential, request.google_credential)
+        student_identity = f"google_{student['sub']}"
+    elif not (teacher_identity and teacher_access_key):
+        raise HTTPException(401, "Class authorization is required")
+    try:
+        return await class_intelligence.get_authorized_meeting_notes(
+            room_code=room_code, meeting_id=meeting_id,
+            student_identity=student_identity,
+            teacher_identity=teacher_identity,
+            teacher_access_key=teacher_access_key,
+        )
+    except class_intelligence.TranscriptAccessDenied:
+        raise HTTPException(403, "You are not authorized to access these class notes")
+    except LookupError:
+        raise HTTPException(404, "Class meeting not found")
+    except Exception:
+        raise HTTPException(503, "Meeting notes service is temporarily unavailable")
+
+
 # ---------------------------------------------------------------------------
 # Teacher — create room
 # ---------------------------------------------------------------------------
 
 @app.post("/api/teacher/create-room", response_model=RoomResponse)
-async def create_room(request: CreateRoomRequest):
+async def create_room(request: CreateRoomRequest, background_tasks: BackgroundTasks):
     if not request.teacher_name.strip():
         raise HTTPException(400, "Teacher name is required")
     if not request.room_name.strip():
@@ -151,6 +240,14 @@ async def create_room(request: CreateRoomRequest):
         student_camera_policy=request.student_camera_policy,
         invite_code=invite_code,
         teacher_access_key=teacher_access_key,
+    )
+
+    class_info = session_state.get_class(room_code)
+    room_created_at = class_info["created_at"].replace(tzinfo=timezone.utc).isoformat()
+    background_tasks.add_task(class_intelligence.persist_new_class,
+        room_code=room_code, class_name=request.room_name,
+        teacher_identity=teacher_identity, teacher_access_key=teacher_access_key,
+        room_created_at=room_created_at,
     )
 
     token = livekit_service.create_access_token(
@@ -358,7 +455,8 @@ async def get_waiting_join_requests(room_code: str, teacher_identity: str = Quer
     return {"requests": [_serialize_join_request(r) for r in session_state.get_waiting_join_requests(room_code.upper())]}
 
 
-async def _decide_join_request(request: JoinRequestDecision, status: str):
+async def _decide_join_request(request: JoinRequestDecision, status: str,
+                               background_tasks: BackgroundTasks | None = None):
     class_info = _verify_teacher(request.room_code, request.teacher_identity)
     if not secrets.compare_digest(class_info["teacher_access_key"], request.teacher_access_key):
         raise HTTPException(403, "Only the authorized teacher can handle join requests")
@@ -368,12 +466,23 @@ async def _decide_join_request(request: JoinRequestDecision, status: str):
     updated = session_state.decide_join_request(request.request_id, status)
     if not updated:
         raise HTTPException(409, "This join request has already been handled")
+    if status == "APPROVED" and background_tasks is not None:
+        # The approved status remains authoritative for this live session. The
+        # persistence attempt happens after the approval response is sent.
+        background_tasks.add_task(class_intelligence.persist_approved_student,
+            room_code=request.room_code.upper(),
+            teacher_identity=request.teacher_identity,
+            teacher_access_key=request.teacher_access_key,
+            student_identity=updated["student_identity"],
+            student_name=updated["student_name"],
+            request_id=request.request_id,
+        )
     return _serialize_join_request(updated)
 
 
 @app.post("/api/teacher/approve-join-request")
-async def approve_join_request(request: JoinRequestDecision):
-    return await _decide_join_request(request, "APPROVED")
+async def approve_join_request(request: JoinRequestDecision, background_tasks: BackgroundTasks):
+    return await _decide_join_request(request, "APPROVED", background_tasks)
 
 
 @app.post("/api/teacher/reject-join-request")
@@ -610,13 +719,21 @@ async def unlock_class(request: LockClassRequest):
 
 
 @app.post("/api/teacher/end-class")
-async def end_class(request: EndClassRequest):
+async def end_class(request: EndClassRequest, background_tasks: BackgroundTasks):
     c  = _verify_teacher(request.room_code, request.teacher_identity)
+    if not secrets.compare_digest(c["teacher_access_key"], request.teacher_access_key):
+        raise HTTPException(403, "Only the authorized teacher can end this class")
     rc = request.room_code.upper()
+    recent_recordings = recording_state.class_recordings.get(rc, [])
+    final_recording_id = c.get("active_recording_id") or (recent_recordings[-1] if recent_recordings else None)
     if session_state.is_recording(rc):
-        active_rec_id = c.get("active_recording_id")
+        active_rec_id = final_recording_id
         if active_rec_id:
             await livekit_service.stop_recording(rc, active_rec_id)
+    background_tasks.add_task(class_intelligence.mark_meeting_ended,
+        room_code=rc, teacher_identity=request.teacher_identity,
+        teacher_access_key=c["teacher_access_key"], recording_id=final_recording_id,
+    )
     session_state.end_class(rc)
     await livekit_service.delete_room(c["livekit_room_name"])
     return {"success": True, "message": "Class ended"}
@@ -727,6 +844,39 @@ async def get_all_recordings(authorization: str | None = Header(default=None)):
             item["playback_url"] = None
         payload.append(item)
     return {"recordings": payload, "total": len(payload)}
+
+
+@app.get("/api/recordings/meeting-notes")
+async def get_recordings_meeting_notes(authorization: str | None = Header(default=None)):
+    """List permanent meeting notes using the existing recordings access token."""
+    _recordings_access_token(authorization)
+    try:
+        meetings = await class_intelligence.list_recordings_meeting_notes()
+    except Exception:
+        raise HTTPException(503, "Meeting notes are temporarily unavailable")
+    return {"meetings": meetings, "total": len(meetings)}
+
+
+@app.get("/api/recordings/meeting-notes/{meeting_id}/download/{language}")
+async def get_recordings_meeting_note_download(
+    meeting_id: str, language: str, authorization: str | None = Header(default=None),
+):
+    """Return one persisted notes language after revalidating recordings access."""
+    _recordings_access_token(authorization)
+    if language not in {"english", "bengali"}:
+        raise HTTPException(400, "Unsupported notes language")
+    try:
+        note = await class_intelligence.get_recordings_meeting_note(meeting_id)
+    except Exception:
+        raise HTTPException(503, "Meeting notes are temporarily unavailable")
+    if note is None:
+        raise HTTPException(404, "Meeting notes not found")
+    if note.get("status") != "ready":
+        raise HTTPException(409, "Meeting notes are not ready for download")
+    content = note.get("english_notes" if language == "english" else "bengali_notes")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(404, "Requested notes language is not available")
+    return {"class_name": note["class_name"], "content": content}
 
 
 @app.get("/api/recordings/{room_code}")

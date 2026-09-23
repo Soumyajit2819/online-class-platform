@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import Link from 'next/link'
 import Hls from 'hls.js'
-import { api, Recording } from '@/lib/api'
+import { api, Recording, RecordingMeetingNotes } from '@/lib/api'
 import PasscodeGate from '@/components/PasscodeGate'
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,18 @@ function useCountdown(expiresAt: string) {
     return () => clearInterval(id)
   }, [expiresAt])
   return state
+}
+
+function notesFilename(className: string, language: 'english' | 'bengali') {
+  const safeClassName = className
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/[. ]+$/g, '')
+    .trim() || 'Class'
+  const safeName = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(safeClassName)
+    ? `_${safeClassName}`
+    : safeClassName
+  const languageLabel = language === 'english' ? 'English' : 'Bengali'
+  return `${safeName} - ${languageLabel} Notes.txt`
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +95,7 @@ function RecordingCard({ recording, onDownload, downloading }: {
           </p>
           <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500">
             <span>🗓 {formatDate(recording.started_at)}</span>
-            <span className="capitalize">{recording.status === 'available' ? '▶ Ready to play' : '⏳ Finalizing recording'}</span>
+            <span className="capitalize">{recording.status === 'available' ? '▶ Ready to play' : recording.status === 'failed' ? '⚠ Recording failed' : '⏳ Finalizing recording'}</span>
           </div>
         </div>
 
@@ -136,6 +148,10 @@ function RecordingCard({ recording, onDownload, downloading }: {
 // ---------------------------------------------------------------------------
 export default function RecordingsPage() {
   const [unlocked, setUnlocked] = useState(false)
+  const handleUnauthorized = useCallback(() => {
+    sessionStorage.removeItem('recordings_access_token')
+    setUnlocked(false)
+  }, [])
 
   if (!unlocked) {
     return (
@@ -151,15 +167,19 @@ export default function RecordingsPage() {
     )
   }
 
-  return <RecordingsList />
+  return <RecordingsList onUnauthorized={handleUnauthorized} />
 }
 
-function RecordingsList() {
+function RecordingsList({ onUnauthorized }: { onUnauthorized: () => void }) {
   const [recordings, setRecordings]   = useState<Recording[]>([])
+  const [meetings, setMeetings] = useState<RecordingMeetingNotes[]>([])
   const [loading, setLoading]         = useState(true)
+  const [notesLoading, setNotesLoading] = useState(true)
   const [error, setError]             = useState('')
+  const [notesError, setNotesError] = useState('')
   const [downloading, setDownloading] = useState<string | null>(null)
   const [downloadError, setDownloadError] = useState('')
+  const [viewingNotes, setViewingNotes] = useState<string | null>(null)
 
   const fetchRecordings = useCallback(async () => {
     setLoading(true)
@@ -172,18 +192,38 @@ function RecordingsList() {
       )
       setRecordings(valid)
     } catch (err: any) {
+      if (err.status === 401) onUnauthorized()
       setError(err.message || 'Failed to fetch recordings')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [onUnauthorized])
+
+  const fetchMeetingNotes = useCallback(async () => {
+    setNotesLoading(true)
+    setNotesError('')
+    try {
+      const result = await api.getRecordingsMeetingNotes()
+      setMeetings(result.meetings)
+    } catch (err: any) {
+      if (err.status === 401) onUnauthorized()
+      setNotesError(err.message || 'Failed to fetch Meeting Notes')
+    } finally {
+      setNotesLoading(false)
+    }
+  }, [onUnauthorized])
+
+  const refreshAll = useCallback(() => {
+    void fetchRecordings()
+    void fetchMeetingNotes()
+  }, [fetchRecordings, fetchMeetingNotes])
 
   useEffect(() => {
-    fetchRecordings()
-    // Refresh list every 60s to catch newly available recordings
-    const id = setInterval(fetchRecordings, 60000)
+    refreshAll()
+    // Refresh recordings and persistent notes together.
+    const id = setInterval(refreshAll, 60000)
     return () => clearInterval(id)
-  }, [fetchRecordings])
+  }, [refreshAll])
 
   const handleDownload = async (recording: Recording) => {
     if (downloading) return
@@ -206,6 +246,44 @@ function RecordingsList() {
     }
   }
 
+  const handleNotesDownload = async (meeting: RecordingMeetingNotes, language: 'english' | 'bengali') => {
+    const key = `notes-${meeting.meeting_id}-${language}`
+    setDownloading(key)
+    setDownloadError('')
+    try {
+      // Revalidate the expiring recordings token for each notes download.
+      const result = await api.getMeetingNotesDownload(meeting.meeting_id, language)
+      const blob = new Blob([`\uFEFF${result.content}`], { type: 'text/plain;charset=utf-8' })
+      const href = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = href
+      link.download = notesFilename(result.class_name, language)
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.setTimeout(() => URL.revokeObjectURL(href), 1000)
+    } catch (err: any) {
+      if (err.status === 401) onUnauthorized()
+      setDownloadError(err.message || 'Notes download failed. Please try again.')
+    } finally {
+      setDownloading(null)
+    }
+  }
+
+  const formatMeetingDate = (date: string) => new Date(date).toLocaleString('en-GB', {
+    day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit',
+  })
+
+  const recordingsById = new Map(recordings.map(recording => [recording.recording_id, recording]))
+  const recordingsByMeeting = new Map(meetings.map(meeting => [
+    meeting.meeting_id,
+    meeting.recording_ids.map(id => recordingsById.get(id))
+      .filter((recording): recording is Recording => Boolean(recording)),
+  ]))
+  const displayedRecordingIds = new Set(
+    Array.from(recordingsByMeeting.values()).flat().map(recording => recording.recording_id)
+  )
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50 p-8">
       <div className="max-w-4xl mx-auto">
@@ -219,7 +297,7 @@ function RecordingsList() {
           </div>
           <div className="flex gap-3">
             <button
-              onClick={fetchRecordings}
+              onClick={refreshAll}
               disabled={loading}
               className="px-4 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-sm transition-colors disabled:opacity-50"
             >
@@ -271,26 +349,114 @@ function RecordingsList() {
             </button>
           </div>
         ) : recordings.length === 0 ? (
-          <div className="bg-white rounded-xl shadow-md p-16 text-center">
-            <div className="text-6xl mb-4">📹</div>
-            <h2 className="text-xl font-semibold text-gray-800 mb-2">No Recordings Available</h2>
-            <p className="text-gray-500 text-sm max-w-sm mx-auto">
-              Recordings appear here after your teacher starts and stops recording during a class.
-              Links expire after 20 hours.
-            </p>
+          <div className="bg-white rounded-xl shadow-md p-8 text-center text-gray-500">
+            No recordings are currently available. Recordings are listed here during their 20-hour availability window.
           </div>
-        ) : (
-          <div className="space-y-4">
-            <p className="text-sm text-gray-500">{recordings.length} recording{recordings.length !== 1 ? 's' : ''} available</p>
-            {recordings.map(rec => (
-              <RecordingCard
-                key={rec.recording_id}
-                recording={rec}
-                onDownload={handleDownload}
-                downloading={downloading === rec.recording_id}
-              />
-            ))}
-          </div>
+        ) : null}
+
+        <section className="mt-10">
+          <h2 className="text-2xl font-bold text-gray-900 mb-4">Classes and Meeting Notes</h2>
+          {notesError && (
+            <div className="mb-4 bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">{notesError}</div>
+          )}
+          {notesLoading ? (
+            <div className="bg-white rounded-xl shadow-md p-8 text-center text-gray-500">Loading Meeting Notes...</div>
+          ) : meetings.length === 0 ? (
+            <div className="bg-white rounded-xl shadow-md p-8 text-center text-gray-500">
+              No class meetings or Meeting Notes are available yet.
+            </div>
+          ) : (
+            <div className="space-y-5">
+              {meetings.map(meeting => {
+                const meetingRecordings = recordingsByMeeting.get(meeting.meeting_id) || []
+                const notesReady = meeting.notes_status === 'ready'
+                  && Boolean(meeting.english_notes?.trim())
+                  && Boolean(meeting.bengali_notes?.trim())
+                const isViewing = viewingNotes === meeting.meeting_id
+                return (
+                  <article key={meeting.meeting_id} className="bg-white rounded-xl shadow-md p-6">
+                    <div className="border-b border-gray-100 pb-4 mb-4">
+                      <h3 className="text-xl font-semibold text-gray-900">{meeting.class_name}</h3>
+                      <p className="mt-1 text-sm text-gray-500">{formatMeetingDate(meeting.meeting_started_at)}</p>
+                    </div>
+
+                    <div className="grid gap-5 md:grid-cols-2">
+                      <section aria-label="Recording">
+                        <h4 className="font-semibold text-gray-800 mb-3">🎥 Recording</h4>
+                        {meetingRecordings.length ? (
+                          <div className="space-y-4">
+                            {meetingRecordings.map(recording => (
+                              <RecordingCard key={recording.recording_id} recording={recording}
+                                onDownload={handleDownload} downloading={downloading === recording.recording_id} />
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 rounded-lg bg-gray-50 p-3">
+                            Recording expired or unavailable. Meeting Notes remain available.
+                          </p>
+                        )}
+                      </section>
+
+                      <section aria-label="Meeting Notes">
+                        <h4 className="font-semibold text-gray-800 mb-3">📝 Meeting Notes</h4>
+                        {notesReady ? (
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap gap-2">
+                              <button onClick={() => handleNotesDownload(meeting, 'english')}
+                                disabled={downloading === `notes-${meeting.meeting_id}-english`}
+                                className="rounded-lg border border-blue-200 px-3 py-2 text-sm text-blue-700 hover:bg-blue-50">
+                                {downloading === `notes-${meeting.meeting_id}-english` ? 'Preparing…' : `📄 ${meeting.class_name} - English Notes.txt`}
+                              </button>
+                              <button onClick={() => handleNotesDownload(meeting, 'bengali')}
+                                disabled={downloading === `notes-${meeting.meeting_id}-bengali`}
+                                className="rounded-lg border border-blue-200 px-3 py-2 text-sm text-blue-700 hover:bg-blue-50">
+                                {downloading === `notes-${meeting.meeting_id}-bengali` ? 'Preparing…' : `📄 ${meeting.class_name} - Bengali Notes.txt`}
+                              </button>
+                            </div>
+                            <button onClick={() => setViewingNotes(isViewing ? null : meeting.meeting_id)}
+                              aria-expanded={isViewing}
+                              className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
+                              {isViewing ? 'Hide Notes' : 'View Notes'}
+                            </button>
+                            {isViewing && (
+                              <div className="space-y-4">
+                                <section>
+                                  <h5 className="font-semibold text-gray-800">English</h5>
+                                  <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-4 text-sm font-sans text-gray-800">{meeting.english_notes}</pre>
+                                </section>
+                                <section lang="bn">
+                                  <h5 className="font-semibold text-gray-800">বাংলা</h5>
+                                  <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-4 text-sm font-sans text-gray-800 [font-family:Arial,'Noto_Sans_Bengali',sans-serif]">{meeting.bengali_notes}</pre>
+                                </section>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 rounded-lg bg-gray-50 p-3">
+                            {meeting.notes_status === 'pending' || meeting.notes_status === 'processing'
+                              ? 'Meeting Notes are being prepared.'
+                              : 'Meeting Notes are not available for this class yet.'}
+                          </p>
+                        )}
+                      </section>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          )}
+        </section>
+
+        {recordings.length > 0 && recordings.some(recording => !displayedRecordingIds.has(recording.recording_id)) && (
+          <section className="mt-10">
+            <h2 className="text-xl font-bold text-gray-900 mb-4">Other Available Recordings</h2>
+            <div className="space-y-4">
+              {recordings.filter(recording => !displayedRecordingIds.has(recording.recording_id)).map(recording => (
+                <RecordingCard key={recording.recording_id} recording={recording}
+                  onDownload={handleDownload} downloading={downloading === recording.recording_id} />
+              ))}
+            </div>
+          </section>
         )}
       </div>
     </main>
