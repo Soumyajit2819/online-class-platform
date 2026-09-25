@@ -32,6 +32,12 @@ export default function Home() {
           >
             📹 Recordings
           </Link>
+          <Link
+            href="/exams/manage"
+            className="w-full sm:w-auto text-center px-8 py-4 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-lg transition-all duration-200 transform hover:scale-105"
+          >
+            📝 Exams Management
+          </Link>
         </div>
         
         <div className="mt-10 sm:mt-16 p-4 sm:p-6 bg-white rounded-lg shadow-md">
