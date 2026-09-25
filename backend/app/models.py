@@ -123,6 +123,10 @@ class TranscriptAccessRequest(BaseModel):
     teacher_access_key: Optional[str] = Field(default=None, min_length=1, max_length=256)
 
 
+class ExamManagementPasswordRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=1024)
+
+
 class StartRecordingRequest(BaseModel):
     room_code: str
     teacher_identity: str

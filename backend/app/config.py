@@ -33,6 +33,13 @@ class Settings:
     CLASS_INTELLIGENCE_STT_PROVIDER: str = os.getenv("CLASS_INTELLIGENCE_STT_PROVIDER", "")
     CLASS_INTELLIGENCE_STT_MODEL: str = os.getenv("CLASS_INTELLIGENCE_STT_MODEL", "")
     SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
+    EXAM_AUDIO_BUCKET: str = os.getenv("EXAM_AUDIO_BUCKET", "exam-audio-private")
+    EXAM_AI_PROVIDER: str = os.getenv("EXAM_AI_PROVIDER", "openrouter")
+    EXAM_AI_MODEL: str = os.getenv("EXAM_AI_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
+    EXAM_AI_API_KEY: str = os.getenv("EXAM_AI_API_KEY", "")
+    EXAM_AI_CONFIDENCE_THRESHOLD: float = float(os.getenv("EXAM_AI_CONFIDENCE_THRESHOLD", "0.75"))
+    EXAM_WHATSAPP_PROVIDER: str = os.getenv("EXAM_WHATSAPP_PROVIDER", "")
+    EXAM_ARTIFACTS_BUCKET: str = os.getenv("EXAM_ARTIFACTS_BUCKET", "exam-artifacts-private")
     CLASS_INTELLIGENCE_NOTES_PROVIDER: str = os.getenv("CLASS_INTELLIGENCE_NOTES_PROVIDER", "")
     CLASS_INTELLIGENCE_NOTES_MODEL: str = os.getenv("CLASS_INTELLIGENCE_NOTES_MODEL", "")
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
@@ -42,6 +49,10 @@ class Settings:
     # independent of LiveKit and storage credentials so neither is ever sent to
     # a browser.
     RECORDING_PLAYBACK_SECRET: str = os.getenv("RECORDING_PLAYBACK_SECRET", "")
+
+    # Dedicated signing key for short-lived Exams management authorization.
+    # Authentication is unavailable when this is unset; never derive a default.
+    EXAM_MANAGEMENT_TOKEN_SECRET: str = os.getenv("EXAM_MANAGEMENT_TOKEN_SECRET", "")
 
     # Admin dashboard password (set a strong value in production)
     ADMIN_DASHBOARD_PASSWORD: str = os.getenv("ADMIN_DASHBOARD_PASSWORD", "")

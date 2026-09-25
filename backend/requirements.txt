@@ -14,6 +14,7 @@ sarvamai==0.1.34
 
 # Supabase
 supabase==2.31.0
+reportlab==4.5.0
 
 # AWS S3 (for Supabase S3-compatible storage)
 boto3==1.34.0
