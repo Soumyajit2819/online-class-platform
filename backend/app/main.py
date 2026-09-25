@@ -24,12 +24,17 @@ from .models import (
     StudentMuteRestrictionRequest, StudentUnmuteRestrictionRequest,
     LockClassRequest, EndClassRequest,
     StartRecordingRequest, StopRecordingRequest,
-    MicrophonePolicy, CameraPolicy, TranscriptAccessRequest,
+    MicrophonePolicy, CameraPolicy, TranscriptAccessRequest, ExamManagementPasswordRequest,
 )
 from .livekit_service import livekit_service, session_state, recording_state
 from .passcode_service import passcode_service
+from .exam_auth import (
+    TOKEN_TTL_SECONDS, create_exam_management_token,
+    exam_management_login_limiter,
+)
 from . import class_intelligence
 from . import transcription
+from .exam_ai.worker import exam_jobs_worker
 from livekit.api import WebhookReceiver, TokenVerifier
 
 
@@ -74,6 +79,7 @@ async def lifespan(app: FastAPI):
     enrollment_retry_task = asyncio.create_task(class_intelligence.enrollment_retry_worker())
     recording_reconciliation_task = asyncio.create_task(livekit_service.reconciliation_worker())
     transcription_task = asyncio.create_task(transcription.transcription_worker())
+    exam_jobs_task = asyncio.create_task(exam_jobs_worker())
     print("✓ Application startup complete")
 
     yield  # app runs here
@@ -83,8 +89,9 @@ async def lifespan(app: FastAPI):
     enrollment_retry_task.cancel()
     recording_reconciliation_task.cancel()
     transcription_task.cancel()
+    exam_jobs_task.cancel()
     await asyncio.gather(task, enrollment_retry_task, recording_reconciliation_task,
-                         transcription_task, return_exceptions=True)
+                         transcription_task, exam_jobs_task, return_exceptions=True)
     print("✓ Application shutdown complete")
 
 
@@ -106,9 +113,15 @@ app.add_middleware(
     allow_origins=settings.allowed_origins,
     allow_origin_regex=settings.local_origin_regex,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Exam-Attempt-Token"],
 )
+
+
+from .exam_students import router as student_exams_router
+from .exams import router as exams_management_router
+app.include_router(student_exams_router)
+app.include_router(exams_management_router)
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1001,10 @@ class UpdatePasscodeRequest(PydanticBase):
     admin_password: str
     new_passcode: str
 
+class ExamWhatsAppNumberRequest(PydanticBase):
+    admin_password: str
+    number: str
+
 
 # ---------------------------------------------------------------------------
 # Passcode endpoints
@@ -1011,6 +1028,45 @@ async def verify_recordings_passcode(request: PasscodeRequest):
         # protected by recording-scoped, short-lived HLS URLs.
         return {"success": True, "message": "Access granted", "access_token": livekit_service.create_recordings_access_token()}
     raise HTTPException(403, "Invalid passcode")
+
+
+@app.post("/api/exams/auth")
+async def authenticate_exam_management(
+    request: ExamManagementPasswordRequest, http_request: Request, response: Response,
+):
+    """Verify the shared Exams password and issue a scoped short-lived token."""
+    if not settings.EXAM_MANAGEMENT_TOKEN_SECRET or len(
+        settings.EXAM_MANAGEMENT_TOKEN_SECRET.encode("utf-8")
+    ) < 32:
+        raise HTTPException(503, "Exams management authorization is unavailable")
+    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(503, "Exams management authorization is unavailable")
+
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    retry_after = exam_management_login_limiter.retry_after(client_ip)
+    if retry_after:
+        raise HTTPException(
+            429, "Too many failed attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    valid = await asyncio.to_thread(passcode_service.verify_exam_management_password, request.password)
+    if not valid:
+        exam_management_login_limiter.record_failure(client_ip)
+        raise HTTPException(403, "Invalid Exams management password")
+
+    exam_management_login_limiter.clear(client_ip)
+    try:
+        token = create_exam_management_token()
+    except RuntimeError:
+        raise HTTPException(503, "Exams management authorization is unavailable")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return {
+        "token": token,
+        "scope": "exam_management",
+        "expires_in": TOKEN_TTL_SECONDS,
+    }
 
 
 @app.post("/api/admin/login")
@@ -1044,6 +1100,36 @@ async def update_recordings_passcode(request: UpdatePasscodeRequest):
     if passcode_service.update_recordings_passcode(request.new_passcode):
         return {"success": True, "message": "Recordings passcode updated"}
     raise HTTPException(500, "Failed to update passcode")
+
+
+@app.post("/api/admin/update-exam-management-password")
+async def update_exam_management_password(request: UpdatePasscodeRequest):
+    if not passcode_service.verify_admin_password(request.admin_password):
+        raise HTTPException(403, "Invalid admin password")
+    if not request.new_passcode or len(request.new_passcode.strip()) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    if await asyncio.to_thread(passcode_service.update_exam_management_password, request.new_passcode):
+        return {"success": True, "message": "Exams management password updated"}
+    raise HTTPException(500, "Failed to update Exams management password")
+
+
+@app.post("/api/admin/exam-whatsapp-number")
+async def get_exam_whatsapp_number(request: AdminLoginRequest):
+    if not passcode_service.verify_admin_password(request.password):
+        raise HTTPException(403, "Invalid admin password")
+    return {"number": passcode_service.get_exam_whatsapp_number()}
+
+
+@app.put("/api/admin/exam-whatsapp-number")
+async def update_exam_whatsapp_number(request: ExamWhatsAppNumberRequest):
+    if not passcode_service.verify_admin_password(request.admin_password):
+        raise HTTPException(403, "Invalid admin password")
+    number = "".join(ch for ch in request.number if ch.isdigit())
+    if not 7 <= len(number) <= 15:
+        raise HTTPException(422, "Enter a valid international WhatsApp destination number.")
+    if not passcode_service.update_exam_whatsapp_number(number):
+        raise HTTPException(503, "Could not save the WhatsApp destination number.")
+    return {"number": number}
 
 
 @app.get("/api/admin/passcode-status")
